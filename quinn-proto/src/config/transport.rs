@@ -46,6 +46,7 @@ pub struct TransportConfig {
     pub(crate) ack_delay_exponent: u8,
     pub(crate) max_ack_delay: Duration,
     pub(crate) min_packet_number_len: u8,
+    pub(crate) early_key_update: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -300,6 +301,16 @@ impl TransportConfig {
         self
     }
 
+    /// Whether to update the 1-RTT keys once early in the connection, after a random 10 to 999
+    /// packets, exercising the peer's key update support
+    ///
+    /// Otherwise keys are updated only as they approach their confidentiality limit, as most
+    /// endpoints do. Defaults to `true`.
+    pub fn early_key_update(&mut self, value: bool) -> &mut Self {
+        self.early_key_update = value;
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -455,6 +466,7 @@ impl Default for TransportConfig {
             ack_delay_exponent: 3,
             max_ack_delay: Duration::from_millis(25),
             min_packet_number_len: 1,
+            early_key_update: true,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -498,6 +510,7 @@ impl fmt::Debug for TransportConfig {
             ack_delay_exponent,
             max_ack_delay,
             min_packet_number_len,
+            early_key_update,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -533,6 +546,7 @@ impl fmt::Debug for TransportConfig {
             .field("ack_delay_exponent", ack_delay_exponent)
             .field("max_ack_delay", max_ack_delay)
             .field("min_packet_number_len", min_packet_number_len)
+            .field("early_key_update", early_key_update)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

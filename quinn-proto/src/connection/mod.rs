@@ -306,7 +306,11 @@ impl Connection {
             // simultaneous key update by both is just like a regular key update with a really fast
             // response. Inspired by quic-go's similar behavior of performing the first key update
             // at the 100th short-header packet.
-            key_phase_size: rng.random_range(10..1000),
+            key_phase_size: if config.early_key_update {
+                rng.random_range(10..1000)
+            } else {
+                u64::MAX
+            },
             peer_params: TransportParameters::default(),
             orig_rem_cid: rem_cid,
             initial_dst_cid: init_cid,
@@ -2211,6 +2215,13 @@ impl Connection {
         );
         trace!("{:?} keys ready", space);
         if space == SpaceId::Data {
+            if !self.config.early_key_update {
+                self.key_phase_size = crypto
+                    .packet
+                    .local
+                    .confidentiality_limit()
+                    .saturating_sub(KEY_UPDATE_MARGIN);
+            }
             // Precompute the first key update
             self.next_crypto = Some(
                 self.crypto
