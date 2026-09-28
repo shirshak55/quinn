@@ -637,7 +637,22 @@ fn prepare_msg(
                     };
                     encoder.push(libc::IPPROTO_IP, libc::IP_PKTINFO, pktinfo);
                 }
-                #[cfg(any(bsd, apple, solarish))]
+                // macOS ignores IP_RECVDSTADDR (IP_SENDSRCADDR elsewhere) on send, but takes
+                // the source address from IP_PKTINFO's `ipi_spec_dst`, as Linux does.
+                #[cfg(apple)]
+                {
+                    if encode_src_ip {
+                        let pktinfo = libc::in_pktinfo {
+                            ipi_ifindex: 0,
+                            ipi_spec_dst: libc::in_addr {
+                                s_addr: u32::from_ne_bytes(v4.octets()),
+                            },
+                            ipi_addr: libc::in_addr { s_addr: 0 },
+                        };
+                        encoder.push(libc::IPPROTO_IP, libc::IP_PKTINFO, pktinfo);
+                    }
+                }
+                #[cfg(any(bsd, solarish))]
                 {
                     if encode_src_ip {
                         let addr = libc::in_addr {
