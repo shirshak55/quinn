@@ -8,8 +8,8 @@ use qlog::streamer::QlogStreamer;
 #[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{
-    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-    connection::qlog::QlogSink,
+    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, MIN_INITIAL_SIZE, VarInt, VarIntBoundsExceeded,
+    congestion, connection::qlog::QlogSink,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -40,6 +40,8 @@ pub struct TransportConfig {
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
+    pub(crate) initial_datagram_size: u16,
+    pub(crate) initial_packet_number: u64,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -193,7 +195,9 @@ impl TransportConfig {
     }
 
     pub(crate) fn get_initial_mtu(&self) -> u16 {
-        self.initial_mtu.max(self.min_mtu)
+        self.initial_mtu
+            .max(self.min_mtu)
+            .max(self.initial_datagram_size)
     }
 
     /// The maximum UDP payload size guaranteed to be supported by the network.
@@ -233,6 +237,24 @@ impl TransportConfig {
     /// too large to be coalesced.
     pub fn pad_to_mtu(&mut self, value: bool) -> &mut Self {
         self.pad_to_mtu = value;
+        self
+    }
+
+    /// The size a client pads each UDP datagram carrying an Initial packet to, and a server each
+    /// carrying an ack-eliciting Initial packet, as do both a path challenge or response
+    ///
+    /// Defaults to 1200, the least QUIC allows; lower values are raised to it. The initial MTU
+    /// (see [`TransportConfig::initial_mtu`]) is at least this size.
+    pub fn initial_datagram_size(&mut self, value: u16) -> &mut Self {
+        self.initial_datagram_size = value.max(MIN_INITIAL_SIZE);
+        self
+    }
+
+    /// The packet number each packet number space starts at
+    ///
+    /// Defaults to 0.
+    pub fn initial_packet_number(&mut self, value: u64) -> &mut Self {
+        self.initial_packet_number = value;
         self
     }
 
@@ -385,6 +407,8 @@ impl Default for TransportConfig {
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
+            initial_datagram_size: MIN_INITIAL_SIZE,
+            initial_packet_number: 0,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -422,6 +446,8 @@ impl fmt::Debug for TransportConfig {
             min_mtu,
             mtu_discovery_config,
             pad_to_mtu,
+            initial_datagram_size,
+            initial_packet_number,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -451,6 +477,8 @@ impl fmt::Debug for TransportConfig {
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
+            .field("initial_datagram_size", initial_datagram_size)
+            .field("initial_packet_number", initial_packet_number)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

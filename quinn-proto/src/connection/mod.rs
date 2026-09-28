@@ -270,6 +270,7 @@ impl Connection {
         let side = connection_side.side();
         let initial_space = PacketSpace {
             crypto: Some(crypto.initial_keys(&init_cid, side)),
+            next_packet_number: config.initial_packet_number,
             ..PacketSpace::new(now)
         };
         let state = State::Handshake(state::Handshake {
@@ -314,7 +315,17 @@ impl Connection {
             endpoint_events: VecDeque::new(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
-            spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
+            spaces: [
+                initial_space,
+                PacketSpace {
+                    next_packet_number: config.initial_packet_number,
+                    ..PacketSpace::new(now)
+                },
+                PacketSpace {
+                    next_packet_number: config.initial_packet_number,
+                    ..PacketSpace::new(now)
+                },
+            ],
             highest_space: SpaceId::Initial,
             prev_crypto: None,
             next_crypto: None,
@@ -522,6 +533,8 @@ impl Connection {
         let mut builder_storage: Option<PacketBuilder> = None;
         let mut sent_frames = None;
         let mut pad_datagram = false;
+        // The size `pad_datagram` pads to: larger for a datagram carrying an Initial packet
+        let mut pad_size = MIN_INITIAL_SIZE;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
 
@@ -641,7 +654,7 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        builder.pad_to(MIN_INITIAL_SIZE);
+                        builder.pad_to(pad_size);
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -734,6 +747,7 @@ impl Connection {
                 num_datagrams += 1;
                 coalesce = true;
                 pad_datagram = false;
+                pad_size = MIN_INITIAL_SIZE;
                 datagram_start = buf.len();
 
                 debug_assert_eq!(
@@ -786,8 +800,10 @@ impl Connection {
             coalesce = coalesce && !builder.short_header;
 
             // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
-            pad_datagram |=
-                space_id == SpaceId::Initial && (self.side.is_client() || ack_eliciting);
+            if space_id == SpaceId::Initial && (self.side.is_client() || ack_eliciting) {
+                pad_datagram = true;
+                pad_size = self.config.initial_datagram_size;
+            }
 
             if close {
                 trace!("sending CONNECTION_CLOSE");
@@ -921,7 +937,7 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                builder.pad_to(MIN_INITIAL_SIZE);
+                builder.pad_to(pad_size);
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
@@ -2508,7 +2524,7 @@ impl Connection {
                 self.rem_handshake_cid = rem_cid;
 
                 let space = &mut self.spaces[SpaceId::Initial];
-                if let Some(info) = space.take(0) {
+                if let Some(info) = space.take(self.config.initial_packet_number) {
                     self.on_packet_acked(now, info);
                 };
 
