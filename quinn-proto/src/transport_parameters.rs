@@ -159,6 +159,8 @@ impl TransportParameters {
             initial_max_stream_data_uni: config.stream_receive_window,
             max_udp_payload_size: endpoint_config.max_udp_payload_size,
             max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
+            ack_delay_exponent: config.ack_delay_exponent.into(),
+            max_ack_delay: VarInt::from_u64(config.max_ack_delay.as_millis() as u64).unwrap(),
             disable_active_migration: server_config.is_some_and(|c| !c.migration),
             active_connection_id_limit: if cid_gen.cid_len() == 0 {
                 2 // i.e. default, i.e. unsent

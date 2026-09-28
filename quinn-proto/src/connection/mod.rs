@@ -349,9 +349,10 @@ impl Connection {
             path_responses: PathResponses::default(),
             close: false,
 
-            ack_frequency: AckFrequencyState::new(get_max_ack_delay(
-                &TransportParameters::default(),
-            )),
+            ack_frequency: AckFrequencyState::new(
+                get_max_ack_delay(&TransportParameters::default()),
+                config.max_ack_delay,
+            ),
             next_bundled_ack_time: None,
 
             pto_count: 0,
@@ -820,6 +821,7 @@ impl Connection {
                         buf,
                         &mut self.stats,
                         buf_capacity,
+                        self.config.ack_delay_exponent,
                     );
                 }
 
@@ -3219,6 +3221,7 @@ impl Connection {
                 buf,
                 &mut self.stats,
                 max_size,
+                self.config.ack_delay_exponent,
             );
         }
 
@@ -3448,6 +3451,7 @@ impl Connection {
                 buf,
                 &mut self.stats,
                 max_size,
+                self.config.ack_delay_exponent,
             );
         }
 
@@ -3469,6 +3473,7 @@ impl Connection {
         buf: &mut Vec<u8>,
         stats: &mut ConnectionStats,
         max_size: usize,
+        ack_delay_exponent: u8,
     ) {
         debug_assert!(!space.pending_acks.ranges().is_empty());
 
@@ -3482,9 +3487,7 @@ impl Connection {
 
         let delay_micros = space.pending_acks.ack_delay(now).as_micros() as u64;
 
-        // TODO: This should come from `TransportConfig` if that gets configurable.
-        let ack_delay_exp = TransportParameters::default().ack_delay_exponent;
-        let delay = delay_micros >> ack_delay_exp.into_inner();
+        let delay = delay_micros >> ack_delay_exponent;
 
         trace!(
             "ACK {:?}, Delay = {}us",
