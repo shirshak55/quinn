@@ -563,6 +563,9 @@ pub struct ClientConfig {
     /// Provider that populates the destination connection ID of Initial Packets
     pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
 
+    /// Generator factory for the connection's own connection IDs, if not the endpoint's
+    pub(crate) cid_generator: Option<Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>>,
+
     /// QUIC protocol version to use
     pub(crate) version: u32,
 }
@@ -577,6 +580,7 @@ impl ClientConfig {
             initial_dst_cid_provider: Arc::new(|| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
             }),
+            cid_generator: None,
             version: 1,
         }
     }
@@ -594,6 +598,24 @@ impl ClientConfig {
         initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
     ) -> &mut Self {
         self.initial_dst_cid_provider = initial_dst_cid_provider;
+        self
+    }
+
+    /// Supply a connection ID generator factory for the connection's own connection IDs
+    ///
+    /// Called once for the connection to obtain the generator of its initial source connection ID
+    /// and of those it issues later, in place of the endpoint's (see
+    /// [`EndpointConfig::cid_generator`]), so a connection can use IDs of another length, zero
+    /// included. The endpoint routes packets to connections of each length it serves; like any
+    /// connection using zero-length IDs, one must be the endpoint's only such connection to its
+    /// remote address.
+    ///
+    /// Defaults to `None`, using the endpoint's generator.
+    pub fn cid_generator<F: Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static>(
+        &mut self,
+        factory: F,
+    ) -> &mut Self {
+        self.cid_generator = Some(Arc::new(factory));
         self
     }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map},
+    collections::{BTreeMap, HashMap, btree_map, hash_map},
     convert::TryFrom,
     fmt, mem,
     net::{IpAddr, SocketAddr},
@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rand::{
     Rng, RngExt, SeedableRng,
     rngs::{StdRng, SysRng},
@@ -27,8 +27,8 @@ use crate::{
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
-        FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
-        PacketNumber, PartialDecode, ProtectedInitialHeader,
+        ConnectionIdParser, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket,
+        PacketDecodeError, PacketNumber, PartialDecode, ProtectedInitialHeader,
     },
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
@@ -47,6 +47,11 @@ pub struct Endpoint {
     index: ConnectionIndex,
     connections: Slab<ConnectionMeta>,
     local_cid_generator: Box<dyn ConnectionIdGenerator>,
+    /// Generators of the client connections that use their own (see
+    /// [`ClientConfig::cid_generator`])
+    conn_cid_generators: FxHashMap<ConnectionHandle, Box<dyn ConnectionIdGenerator>>,
+    /// How many of those connections use each length other than `local_cid_generator`'s
+    conn_cid_lens: BTreeMap<usize, usize>,
     config: Arc<EndpointConfig>,
     server_config: Option<Arc<ServerConfig>>,
     /// Whether the underlying UDP socket promises not to fragment packets
@@ -84,6 +89,8 @@ impl Endpoint {
             index: ConnectionIndex::default(),
             connections: Slab::new(),
             local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
+            conn_cid_generators: FxHashMap::default(),
+            conn_cid_lens: BTreeMap::new(),
             config,
             server_config,
             allow_mtud,
@@ -133,6 +140,15 @@ impl Endpoint {
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {
                     self.index.remove(&conn);
+                    let cid_len = self.conn_cid_generators.remove(&ch).map(|g| g.cid_len());
+                    if let Some(btree_map::Entry::Occupied(mut count)) =
+                        cid_len.map(|len| self.conn_cid_lens.entry(len))
+                    {
+                        *count.get_mut() -= 1;
+                        if *count.get() == 0 {
+                            count.remove();
+                        }
+                    }
                 } else {
                     // This indicates a bug in downstream code, which could cause spurious
                     // connection loss instead of this error if the CID was (re)allocated prior to
@@ -158,7 +174,12 @@ impl Endpoint {
         let datagram_len = data.len();
         let event = match PartialDecode::new(
             data,
-            &FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len()),
+            &EndpointCidParser {
+                len: self.local_cid_generator.cid_len(),
+                conn_lens: &self.conn_cid_lens,
+                index: &self.index,
+                remote,
+            },
             &self.config.supported_versions,
             self.config.grease_quic_bit,
         ) {
@@ -342,7 +363,12 @@ impl Endpoint {
         remote: SocketAddr,
         server_name: &str,
     ) -> Result<(ConnectionHandle, Connection), ConnectError> {
-        if self.cids_exhausted() {
+        let cid_generator = config.cid_generator.as_ref().map(|factory| factory());
+        let cid_len = cid_generator
+            .as_ref()
+            .unwrap_or(&self.local_cid_generator)
+            .cid_len();
+        if self.cids_exhausted(cid_len) {
             return Err(ConnectError::CidsExhausted);
         }
         if remote.port() == 0 || remote.ip().is_unspecified() {
@@ -356,18 +382,27 @@ impl Endpoint {
         trace!(initial_dcid = %remote_id);
 
         let ch = ConnectionHandle(self.connections.vacant_key());
+        if let Some(generator) = cid_generator {
+            self.conn_cid_generators.insert(ch, generator);
+        }
         let loc_cid = self.new_cid(ch);
         let params = TransportParameters::new(
             &config.transport,
             &self.config,
-            self.local_cid_generator.as_ref(),
+            self.conn_cid_generators
+                .get(&ch)
+                .unwrap_or(&self.local_cid_generator)
+                .as_ref(),
             loc_cid,
             None,
             &mut self.rng,
         );
         let tls = config
             .crypto
-            .start_session(config.version, server_name, &params)?;
+            .start_session(config.version, server_name, &params)
+            .inspect_err(|_| {
+                self.conn_cid_generators.remove(&ch);
+            })?;
 
         let conn = self.add_connection(
             ch,
@@ -414,11 +449,15 @@ impl Endpoint {
 
     /// Generate a connection ID for `ch`
     fn new_cid(&mut self, ch: ConnectionHandle) -> ConnectionId {
+        let generator = self
+            .conn_cid_generators
+            .get_mut(&ch)
+            .unwrap_or(&mut self.local_cid_generator);
         loop {
-            let cid = self.local_cid_generator.generate_cid();
+            let cid = generator.generate_cid();
             if cid.is_empty() {
                 // Zero-length CID; nothing to track
-                debug_assert_eq!(self.local_cid_generator.cid_len(), 0);
+                debug_assert_eq!(generator.cid_len(), 0);
                 return cid;
             }
             if let hash_map::Entry::Vacant(e) = self.index.connection_ids.entry(cid) {
@@ -452,7 +491,9 @@ impl Endpoint {
 
         // Saturation only happens under heavy load, where deriving initial keys per Initial just to
         // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
-        if self.cids_exhausted() || self.incoming_buffers.len() >= server_config.max_incoming {
+        if self.cids_exhausted(self.local_cid_generator.cid_len())
+            || self.incoming_buffers.len() >= server_config.max_incoming
+        {
             debug!(
                 "ignoring initial for connection {} due to saturation",
                 dst_cid
@@ -582,7 +623,7 @@ impl Endpoint {
             });
         }
 
-        if self.cids_exhausted() {
+        if self.cids_exhausted(self.local_cid_generator.cid_len()) {
             debug!("refusing connection");
             self.index.remove_initial(dst_cid);
             return Err(AcceptError {
@@ -824,6 +865,11 @@ impl Endpoint {
         self.rng.fill_bytes(&mut rng_seed);
         let side = side_args.side();
         let pref_addr_cid = side_args.pref_addr_cid();
+        let cid_generator = self
+            .conn_cid_generators
+            .get(&ch)
+            .unwrap_or(&self.local_cid_generator);
+        let cid_len = cid_generator.cid_len();
         let conn = Connection::new(
             self.config.clone(),
             transport_config,
@@ -833,7 +879,7 @@ impl Endpoint {
             addresses.remote,
             addresses.local_ip,
             tls,
-            self.local_cid_generator.as_ref(),
+            cid_generator.as_ref(),
             now,
             version,
             self.allow_mtud,
@@ -862,6 +908,9 @@ impl Endpoint {
             reset_token: None,
         });
         debug_assert_eq!(id, ch.0, "connection handle allocation out of sync");
+        if cid_len != self.local_cid_generator.cid_len() {
+            *self.conn_cid_lens.entry(cid_len).or_default() += 1;
+        }
 
         self.index.insert_conn(addresses, loc_cid, ch, side);
 
@@ -938,16 +987,15 @@ impl Endpoint {
         self.index.connection_ids.len()
     }
 
-    /// Whether we've used up 3/4 of the available CID space
+    /// Whether we've used up 3/4 of the available space of CIDs `cid_len` bytes long
     ///
     /// We leave some space unused so that `new_cid` can be relied upon to finish quickly. We don't
     /// bother to check when CID longer than 4 bytes are used because 2^40 connections is a lot.
-    fn cids_exhausted(&self) -> bool {
-        self.local_cid_generator.cid_len() <= 4
-            && self.local_cid_generator.cid_len() != 0
-            && (2usize.pow(self.local_cid_generator.cid_len() as u32 * 8)
-                - self.index.connection_ids.len())
-                < 2usize.pow(self.local_cid_generator.cid_len() as u32 * 8 - 2)
+    fn cids_exhausted(&self, cid_len: usize) -> bool {
+        cid_len <= 4
+            && cid_len != 0
+            && (2usize.pow(cid_len as u32 * 8) - self.index.connection_ids.len())
+                < 2usize.pow(cid_len as u32 * 8 - 2)
     }
 }
 
@@ -1137,6 +1185,44 @@ pub(crate) struct ConnectionMeta {
     /// Reset token provided by the peer for the CID we're currently sending to, and the address
     /// being sent to
     reset_token: Option<(SocketAddr, ResetToken)>,
+}
+
+/// Parses a short header's destination connection ID as `len` bytes long, or as long as one a
+/// client connection with its own generator issued (see [`ClientConfig::cid_generator`]), from
+/// the lengths such connections use (`conn_lens`)
+struct EndpointCidParser<'a> {
+    len: usize,
+    conn_lens: &'a BTreeMap<usize, usize>,
+    index: &'a ConnectionIndex,
+    remote: SocketAddr,
+}
+
+impl ConnectionIdParser for EndpointCidParser<'_> {
+    fn parse(&self, buf: &mut dyn Buf) -> Result<ConnectionId, PacketDecodeError> {
+        let bytes = buf.chunk();
+        let issued = |len: usize| {
+            bytes.get(..len).is_some_and(|cid| {
+                self.index
+                    .connection_ids
+                    .contains_key(&ConnectionId::new(cid))
+            })
+        };
+        let len = if self.conn_lens.is_empty() || issued(self.len) {
+            self.len
+        } else if let Some(&len) = self.conn_lens.keys().find(|&&len| len != 0 && issued(len)) {
+            len
+        } else if self.conn_lens.contains_key(&0)
+            && self
+                .index
+                .outgoing_connection_remotes
+                .contains_key(&self.remote)
+        {
+            0
+        } else {
+            self.len
+        };
+        FixedLengthConnectionIdParser::new(len).parse(buf)
+    }
 }
 
 /// Internal identifier for a `Connection` currently associated with an endpoint
