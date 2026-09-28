@@ -9,7 +9,7 @@ use qlog::streamer::QlogStreamer;
 use crate::QlogStream;
 use crate::{
     Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, MIN_INITIAL_SIZE, VarInt, VarIntBoundsExceeded,
-    congestion, connection::qlog::QlogSink,
+    cid_queue::CidQueue, congestion, connection::qlog::QlogSink,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -42,6 +42,7 @@ pub struct TransportConfig {
     pub(crate) pad_to_mtu: bool,
     pub(crate) initial_datagram_size: u16,
     pub(crate) initial_packet_number: u64,
+    pub(crate) active_connection_id_limit: u32,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -258,6 +259,16 @@ impl TransportConfig {
         self
     }
 
+    /// How many of the peer's connection IDs this endpoint stores, which it advertises as its
+    /// active_connection_id_limit transport parameter unless its own connection IDs are
+    /// zero-length (then it sends none, meaning 2)
+    ///
+    /// Defaults to 5. Values are clamped to 2..=64.
+    pub fn active_connection_id_limit(&mut self, value: u32) -> &mut Self {
+        self.active_connection_id_limit = value.clamp(2, 64);
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -409,6 +420,7 @@ impl Default for TransportConfig {
             pad_to_mtu: false,
             initial_datagram_size: MIN_INITIAL_SIZE,
             initial_packet_number: 0,
+            active_connection_id_limit: CidQueue::LEN as u32,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -448,6 +460,7 @@ impl fmt::Debug for TransportConfig {
             pad_to_mtu,
             initial_datagram_size,
             initial_packet_number,
+            active_connection_id_limit,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -479,6 +492,7 @@ impl fmt::Debug for TransportConfig {
             .field("pad_to_mtu", pad_to_mtu)
             .field("initial_datagram_size", initial_datagram_size)
             .field("initial_packet_number", initial_packet_number)
+            .field("active_connection_id_limit", active_connection_id_limit)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

@@ -10,8 +10,8 @@ type CidData = (ConnectionId, Option<ResetToken>);
 /// May contain gaps due to packet loss or reordering
 #[derive(Debug)]
 pub(crate) struct CidQueue {
-    /// Ring buffer indexed by `self.cursor`
-    buffer: [Option<CidData>; Self::LEN],
+    /// Ring buffer indexed by `self.cursor`, as long as the active connection ID limit
+    buffer: Box<[Option<CidData>]>,
     /// Index at which circular buffer addressing is based
     cursor: usize,
     /// Sequence number of `self.buffer[cursor]`
@@ -21,8 +21,9 @@ pub(crate) struct CidQueue {
 }
 
 impl CidQueue {
-    pub(crate) fn new(cid: ConnectionId) -> Self {
-        let mut buffer = [None; Self::LEN];
+    /// A queue holding up to `limit` connection IDs, the active one first
+    pub(crate) fn new(cid: ConnectionId, limit: usize) -> Self {
+        let mut buffer = vec![None; limit].into_boxed_slice();
         buffer[0] = Some((cid, None));
         Self {
             buffer,
@@ -46,17 +47,17 @@ impl CidQueue {
         };
 
         let retired_count = cid.retire_prior_to.saturating_sub(self.offset);
-        if index >= Self::LEN as u64 + retired_count {
+        if index >= self.buffer.len() as u64 + retired_count {
             return Err(InsertError::ExceedsLimit);
         }
 
         // Discard retired CIDs, if any
-        for i in 0..(retired_count.min(Self::LEN as u64) as usize) {
-            self.buffer[(self.cursor + i) % Self::LEN] = None;
+        for i in 0..(retired_count.min(self.buffer.len() as u64) as usize) {
+            self.buffer[(self.cursor + i) % self.buffer.len()] = None;
         }
 
         // Record the new CID
-        let index = ((self.cursor as u64 + index) % Self::LEN as u64) as usize;
+        let index = ((self.cursor as u64 + index) % self.buffer.len() as u64) as usize;
         self.buffer[index] = Some((cid.id, Some(cid.reset_token)));
 
         if retired_count == 0 {
@@ -66,22 +67,22 @@ impl CidQueue {
         // The active CID was retired. Find the first known CID with sequence number of at least
         // retire_prior_to, and inform the caller that all prior CIDs have been retired, and of
         // the new CID's reset token.
-        self.cursor = ((self.cursor as u64 + retired_count) % Self::LEN as u64) as usize;
+        self.cursor = ((self.cursor as u64 + retired_count) % self.buffer.len() as u64) as usize;
         let (i, (_, token)) = self
             .iter()
             .next()
             .expect("it is impossible to retire a CID without supplying a new one");
-        self.cursor = (self.cursor + i) % Self::LEN;
+        self.cursor = (self.cursor + i) % self.buffer.len();
         let orig_offset = self.offset;
         self.offset = cid.retire_prior_to + i as u64;
         // We don't immediately retire CIDs in the range (orig_offset +
-        // Self::LEN)..self.offset. These are CIDs that we haven't yet received from a
+        // self.buffer.len())..self.offset. These are CIDs that we haven't yet received from a
         // NEW_CONNECTION_ID frame, since having previously received them would violate the
-        // connection ID limit we specified based on Self::LEN. If we do receive a such a frame
+        // connection ID limit we specified. If we do receive a such a frame
         // in the future, e.g. due to reordering, we'll retire it then. This ensures we can't be
         // made to buffer an arbitrarily large number of RETIRE_CONNECTION_ID frames.
         Ok(Some((
-            orig_offset..self.offset.min(orig_offset + Self::LEN as u64),
+            orig_offset..self.offset.min(orig_offset + self.buffer.len() as u64),
             token.expect("non-initial CID missing reset token"),
         )))
     }
@@ -94,14 +95,14 @@ impl CidQueue {
 
         let orig_offset = self.offset;
         self.offset += i as u64;
-        self.cursor = (self.cursor + i) % Self::LEN;
+        self.cursor = (self.cursor + i) % self.buffer.len();
         Some((cid_data.1.unwrap(), orig_offset..self.offset))
     }
 
     /// Iterate CIDs in CidQueue that are not `None`, including the active CID
     fn iter(&self) -> impl Iterator<Item = (usize, CidData)> + '_ {
-        (0..Self::LEN).filter_map(move |step| {
-            let index = (self.cursor + step) % Self::LEN;
+        (0..self.buffer.len()).filter_map(move |step| {
+            let index = (self.cursor + step) % self.buffer.len();
             self.buffer[index].map(|cid_data| (step, cid_data))
         })
     }
@@ -122,6 +123,7 @@ impl CidQueue {
         self.offset
     }
 
+    /// The default active connection ID limit
     pub(crate) const LEN: usize = 5;
 }
 
@@ -152,7 +154,7 @@ mod tests {
 
     #[test]
     fn next_dense() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         assert!(q.next().is_none());
         assert!(q.next().is_none());
 
@@ -168,7 +170,7 @@ mod tests {
     }
     #[test]
     fn next_sparse() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         let seqs = (1..CidQueue::LEN as u64).filter(|x| x % 2 == 0);
         for i in seqs.clone() {
             q.insert(cid(i, 0)).unwrap();
@@ -184,7 +186,7 @@ mod tests {
 
     #[test]
     fn wrap() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
 
         for i in 1..CidQueue::LEN as u64 {
             q.insert(cid(i, 0)).unwrap();
@@ -204,7 +206,7 @@ mod tests {
 
     #[test]
     fn retire_dense() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
 
         for i in 1..CidQueue::LEN as u64 {
             q.insert(cid(i, 0)).unwrap();
@@ -227,7 +229,7 @@ mod tests {
     #[test]
     fn retire_sparse() {
         // Retiring CID 0 when CID 1 is not known should retire CID 1 as we move to CID 2
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         q.insert(cid(2, 0)).unwrap();
         assert_eq!(q.insert(cid(3, 1)).unwrap().unwrap().0, 0..2,);
         assert_eq!(q.active_seq(), 2);
@@ -235,7 +237,7 @@ mod tests {
 
     #[test]
     fn retire_many() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         q.insert(cid(2, 0)).unwrap();
         assert_eq!(
             q.insert(cid(1_000_000, 1_000_000)).unwrap().unwrap().0,
@@ -246,7 +248,7 @@ mod tests {
 
     #[test]
     fn insert_limit() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         assert_eq!(q.insert(cid(CidQueue::LEN as u64 - 1, 0)), Ok(None));
         assert_eq!(
             q.insert(cid(CidQueue::LEN as u64, 0)),
@@ -256,14 +258,14 @@ mod tests {
 
     #[test]
     fn insert_duplicate() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         q.insert(cid(0, 0)).unwrap();
         q.insert(cid(0, 0)).unwrap();
     }
 
     #[test]
     fn insert_retired() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         assert_eq!(
             q.insert(cid(0, 0)),
             Ok(None),
@@ -281,7 +283,7 @@ mod tests {
 
     #[test]
     fn retire_then_insert_next() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         for i in 1..CidQueue::LEN as u64 {
             q.insert(cid(i, 0)).unwrap();
         }
@@ -295,7 +297,7 @@ mod tests {
 
     #[test]
     fn always_valid() {
-        let mut q = CidQueue::new(initial_cid());
+        let mut q = CidQueue::new(initial_cid(), CidQueue::LEN);
         assert!(q.next().is_none());
         assert_eq!(q.active(), initial_cid());
         assert_eq!(q.active_seq(), 0);
