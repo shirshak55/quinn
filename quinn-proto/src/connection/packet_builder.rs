@@ -86,7 +86,11 @@ impl PacketBuilder {
 
         let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
 
-        let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+        let number = PacketNumber::new_with_min_len(
+            exact_number,
+            space.largest_acked_packet.unwrap_or(0),
+            conn.config.min_packet_number_len,
+        );
         let header = match space_id {
             SpaceId::Data if space.crypto.is_some() => Header::Short {
                 dst_cid,

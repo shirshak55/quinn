@@ -45,6 +45,7 @@ pub struct TransportConfig {
     pub(crate) active_connection_id_limit: u32,
     pub(crate) ack_delay_exponent: u8,
     pub(crate) max_ack_delay: Duration,
+    pub(crate) min_packet_number_len: u8,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -290,6 +291,15 @@ impl TransportConfig {
         self
     }
 
+    /// The fewest bytes a packet number is encoded in
+    ///
+    /// Packet numbers are encoded in as few bytes as the peer can decode them from, and at
+    /// least this many. Defaults to 1; values are clamped to 1..=4.
+    pub fn min_packet_number_len(&mut self, value: u8) -> &mut Self {
+        self.min_packet_number_len = value.clamp(1, 4);
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -444,6 +454,7 @@ impl Default for TransportConfig {
             active_connection_id_limit: CidQueue::LEN as u32,
             ack_delay_exponent: 3,
             max_ack_delay: Duration::from_millis(25),
+            min_packet_number_len: 1,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -486,6 +497,7 @@ impl fmt::Debug for TransportConfig {
             active_connection_id_limit,
             ack_delay_exponent,
             max_ack_delay,
+            min_packet_number_len,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -520,6 +532,7 @@ impl fmt::Debug for TransportConfig {
             .field("active_connection_id_limit", active_connection_id_limit)
             .field("ack_delay_exponent", ack_delay_exponent)
             .field("max_ack_delay", max_ack_delay)
+            .field("min_packet_number_len", min_packet_number_len)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

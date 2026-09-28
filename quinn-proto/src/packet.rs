@@ -702,6 +702,17 @@ impl PacketNumber {
         }
     }
 
+    /// `n` encoded as by [`PacketNumber::new`], but in at least `min_len` bytes
+    pub(crate) fn new_with_min_len(n: u64, largest_acked: u64, min_len: u8) -> Self {
+        let number = Self::new(n, largest_acked);
+        match min_len {
+            _ if number.len() >= usize::from(min_len) => number,
+            2 => Self::U16(n as u16),
+            3 => Self::U24(n as u32),
+            _ => Self::U32(n as u32),
+        }
+    }
+
     pub(crate) fn len(self) -> usize {
         use PacketNumber::*;
         match self {
