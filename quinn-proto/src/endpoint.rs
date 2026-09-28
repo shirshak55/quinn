@@ -28,7 +28,7 @@ use crate::{
     frame,
     packet::{
         ConnectionIdParser, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket,
-        PacketDecodeError, PacketNumber, PartialDecode, ProtectedInitialHeader,
+        Packet, PacketDecodeError, PacketNumber, PartialDecode, ProtectedInitialHeader,
     },
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
@@ -584,6 +584,78 @@ impl Endpoint {
         }))
     }
 
+    /// What the client's packets for `incoming` carried so far: its first Initial and those
+    /// buffered since, decrypted with the Initial keys without being consumed.
+    pub fn incoming_first_flight(&self, incoming: &Incoming) -> FirstFlight {
+        let header = &incoming.packet.header;
+        let mut flight = FirstFlight {
+            version: header.version,
+            dst_cid_len: header.dst_cid.len(),
+            src_cid_len: header.src_cid.len(),
+            token_len: header.token.len(),
+            ..FirstFlight::default()
+        };
+        let mut crypto = Vec::new();
+        let mut largest = None;
+        let first = Packet {
+            header: Header::Initial(incoming.packet.header.clone()),
+            header_data: incoming.packet.header_data.clone(),
+            payload: incoming.packet.payload.clone(),
+        };
+        flight.datagram_sizes.push(
+            first.header_data.len()
+                + first.payload.len()
+                + incoming.rest.as_ref().map_or(0, BytesMut::len),
+        );
+        flight.read(first, &incoming.crypto, &mut largest, &mut crypto);
+        let parser = FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len());
+        // The rest of the first datagram, then each datagram buffered since.
+        let chunks = incoming.rest.iter().map(|rest| (rest.clone(), false)).chain(
+            self.incoming_buffers[incoming.incoming_idx]
+                .datagrams
+                .iter()
+                .map(|event| {
+                    let mut datagram = BytesMut::from(event.first_decode.data());
+                    if let Some(rest) = &event.remaining {
+                        datagram.extend_from_slice(rest);
+                    }
+                    (datagram, true)
+                }),
+        );
+        for (mut bytes, datagram) in chunks {
+            if datagram {
+                flight.datagram_sizes.push(bytes.len());
+            }
+            while !bytes.is_empty() {
+                let Ok((partial, rest)) = PartialDecode::new(
+                    bytes,
+                    &parser,
+                    &self.config.supported_versions,
+                    self.config.grease_quic_bit,
+                ) else {
+                    break;
+                };
+                if partial.is_0rtt() {
+                    flight.zero_rtt = true;
+                } else if partial.is_initial() {
+                    if let Ok(packet) = partial.finish(Some(&*incoming.crypto.header.remote)) {
+                        flight.read(packet, &incoming.crypto, &mut largest, &mut crypto);
+                    }
+                }
+                bytes = rest.unwrap_or_default();
+            }
+        }
+        crypto.sort_by_key(|(offset, _)| *offset);
+        for (offset, data) in crypto {
+            let end = offset as usize + data.len();
+            if offset as usize <= flight.crypto.len() && end > flight.crypto.len() {
+                let skip = flight.crypto.len() - offset as usize;
+                flight.crypto.extend_from_slice(&data[skip..]);
+            }
+        }
+        flight
+    }
+
     /// Attempt to accept this incoming connection (an error may still occur)
     // AcceptError cannot be made smaller without semver breakage
     #[allow(clippy::result_large_err)]
@@ -1014,6 +1086,62 @@ impl fmt::Debug for Endpoint {
                 &self.all_incoming_buffers_total_bytes,
             )
             .finish()
+    }
+}
+
+/// What a client's packets for an [`Incoming`] connection carried so far (see
+/// [`Endpoint::incoming_first_flight`])
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct FirstFlight {
+    /// The QUIC version of its first Initial packet
+    pub version: u32,
+    /// Its destination and source connection ID lengths, and its token's
+    pub dst_cid_len: usize,
+    pub src_cid_len: usize,
+    pub token_len: usize,
+    /// Each UDP datagram's length, in arrival order
+    pub datagram_sizes: Vec<usize>,
+    /// Each Initial packet's number and encoded packet number length, in arrival order
+    pub packets: Vec<(u64, u8)>,
+    /// The Initial CRYPTO stream from offset 0, as far as it is contiguous
+    pub crypto: Vec<u8>,
+    /// Whether a 0-RTT packet arrived
+    pub zero_rtt: bool,
+}
+
+impl FirstFlight {
+    fn read(
+        &mut self,
+        mut packet: Packet,
+        keys: &Keys,
+        largest: &mut Option<u64>,
+        crypto: &mut Vec<(u64, Bytes)>,
+    ) {
+        let Some(number) = packet.header.number() else {
+            return;
+        };
+        let pn = number.expand(largest.map_or(0, |n| n + 1));
+        if keys
+            .packet
+            .remote
+            .decrypt(pn, &packet.header_data, &mut packet.payload)
+            .is_err()
+        {
+            return;
+        }
+        *largest = Some(largest.map_or(pn, |n| n.max(pn)));
+        self.packets.push((pn, number.len() as u8));
+        let Ok(frames) = frame::Iter::new(packet.payload.freeze()) else {
+            return;
+        };
+        for frame in frames {
+            match frame {
+                Ok(frame::Frame::Crypto(frame)) => crypto.push((frame.offset, frame.data)),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
     }
 }
 

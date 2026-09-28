@@ -462,6 +462,14 @@ impl EndpointInner {
         Ok(())
     }
 
+    pub(crate) fn first_flight(&self, incoming: &proto::Incoming) -> proto::FirstFlight {
+        self.state
+            .lock()
+            .unwrap()
+            .inner
+            .incoming_first_flight(incoming)
+    }
+
     pub(crate) fn ignore(&self, incoming: proto::Incoming) {
         let mut state = self.state.lock().unwrap();
         state.stats.ignored_handshakes += 1;

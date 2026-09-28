@@ -509,11 +509,16 @@ impl TryFrom<Arc<rustls::ServerConfig>> for QuicServerConfig {
     }
 }
 
-impl crypto::ServerConfig for QuicServerConfig {
-    fn start_session(
+impl QuicServerConfig {
+    /// A session as [`crypto::ServerConfig::start_session`] starts, sending `params`, an encoded
+    /// transport parameter list, as its transport parameters
+    ///
+    /// The list must carry the connection's own connection IDs and stateless reset token, and
+    /// announce limits the connection's transport configuration keeps.
+    pub fn start_session_with_encoded_params(
         self: Arc<Self>,
         version: u32,
-        params: &TransportParameters,
+        params: Vec<u8>,
     ) -> Box<dyn crypto::Session> {
         // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
         let version = interpret_version(version).unwrap();
@@ -522,11 +527,20 @@ impl crypto::ServerConfig for QuicServerConfig {
             got_handshake_data: false,
             next_secrets: None,
             inner: rustls::quic::Connection::Server(
-                rustls::quic::ServerConnection::new(self.inner.clone(), version, to_vec(params))
-                    .unwrap(),
+                rustls::quic::ServerConnection::new(self.inner.clone(), version, params).unwrap(),
             ),
             suite: self.initial,
         })
+    }
+}
+
+impl crypto::ServerConfig for QuicServerConfig {
+    fn start_session(
+        self: Arc<Self>,
+        version: u32,
+        params: &TransportParameters,
+    ) -> Box<dyn crypto::Session> {
+        self.start_session_with_encoded_params(version, to_vec(params))
     }
 
     fn initial_keys(

@@ -23,6 +23,13 @@ impl Incoming {
         Self(Some(State { inner, endpoint }))
     }
 
+    /// What the client's packets carried so far: its first Initial and those buffered since
+    /// (see [`proto::Endpoint::incoming_first_flight`])
+    pub fn first_flight(&self) -> proto::FirstFlight {
+        let state = self.0.as_ref().unwrap();
+        state.endpoint.first_flight(&state.inner)
+    }
+
     /// Attempt to accept this incoming connection (an error may still occur)
     pub fn accept(mut self) -> Result<Connecting, ConnectionError> {
         let state = self.0.take().unwrap();
