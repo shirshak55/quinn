@@ -80,6 +80,13 @@ pub struct UdpSocketState {
     /// In particular, we do not use IP_TOS cmsg_type in this case,
     /// which is not supported on Linux <3.13 and results in not sending the UDP packet at all.
     sendmsg_einval: AtomicBool,
+
+    /// Whether the socket was connected when this state was created
+    ///
+    /// macOS refuses a destination address on a connected socket (EISCONN), so its transmits
+    /// name none and go to the peer; a connected socket also reports the ICMP errors its
+    /// datagrams meet (ECONNREFUSED, EHOSTUNREACH) on its next send or receive.
+    connected: bool,
 }
 
 impl UdpSocketState {
@@ -190,6 +197,7 @@ impl UdpSocketState {
             gro_segments: gro::gro_segments(),
             may_fragment,
             sendmsg_einval: AtomicBool::new(false),
+            connected: io.peer_addr().is_ok(),
         })
     }
 
@@ -327,6 +335,7 @@ fn send(
         &mut cmsgs,
         encode_src_ip,
         state.sendmsg_einval(),
+        state.connected,
     );
 
     loop {
@@ -371,6 +380,7 @@ fn send(
                         &mut cmsgs,
                         encode_src_ip,
                         state.sendmsg_einval(),
+                        state.connected,
                     );
                     continue;
                 }
@@ -410,6 +420,7 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
             &mut ctrls[i],
             true,
             state.sendmsg_einval(),
+            state.connected,
         );
         hdrs[i].msg_datalen = chunk.len();
         cnt += 1;
@@ -444,6 +455,7 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
         &mut ctrl,
         cfg!(apple) || cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd"),
         state.sendmsg_einval(),
+        state.connected,
     );
     loop {
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) };
@@ -578,6 +590,8 @@ fn prepare_msg(
     #[allow(unused_variables)] // only used on FreeBSD & macOS
     encode_src_ip: bool,
     sendmsg_einval: bool,
+    #[allow(unused_variables)] // only used on macOS
+    connected: bool,
 ) {
     iov.iov_base = transmit.contents.as_ptr() as *const _ as *mut _;
     iov.iov_len = transmit.contents.len();
@@ -591,6 +605,12 @@ fn prepare_msg(
     let namelen = dst_addr.len();
     hdr.msg_name = name as *mut _;
     hdr.msg_namelen = namelen;
+    // A connected socket's datagrams go to its peer: macOS refuses a destination (EISCONN).
+    #[cfg(apple)]
+    if connected {
+        hdr.msg_name = std::ptr::null_mut();
+        hdr.msg_namelen = 0;
+    }
     hdr.msg_iov = iov;
     hdr.msg_iovlen = 1;
 

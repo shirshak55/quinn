@@ -154,9 +154,15 @@ impl TransportParameters {
             initial_max_streams_bidi: config.max_concurrent_bidi_streams,
             initial_max_streams_uni: config.max_concurrent_uni_streams,
             initial_max_data: config.receive_window,
-            initial_max_stream_data_bidi_local: config.stream_receive_window,
-            initial_max_stream_data_bidi_remote: config.stream_receive_window,
-            initial_max_stream_data_uni: config.stream_receive_window,
+            initial_max_stream_data_bidi_local: config
+                .stream_receive_window_bidi_local
+                .unwrap_or(config.stream_receive_window),
+            initial_max_stream_data_bidi_remote: config
+                .stream_receive_window_bidi_remote
+                .unwrap_or(config.stream_receive_window),
+            initial_max_stream_data_uni: config
+                .stream_receive_window_uni
+                .unwrap_or(config.stream_receive_window),
             max_udp_payload_size: endpoint_config.max_udp_payload_size,
             max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
             ack_delay_exponent: config.ack_delay_exponent.into(),
@@ -173,7 +179,7 @@ impl TransportParameters {
                 .map(|x| (x.min(u16::MAX.into()) as u16).into()),
             grease_quic_bit: endpoint_config.grease_quic_bit,
             min_ack_delay: Some(
-                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
+                VarInt::from_u64(u64::try_from(config.min_ack_delay.as_micros()).unwrap()).unwrap(),
             ),
             grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
             write_order: Some({

@@ -18,12 +18,19 @@ pub(super) struct AckFrequencyState {
     //
     last_ack_frequency_frame: Option<u64>,
     pub(super) max_ack_delay: Duration,
+    /// The min_ack_delay this endpoint advertised
+    min_ack_delay: Duration,
 }
 
 impl AckFrequencyState {
     /// The state before any transport parameters or ACK_FREQUENCY frames arrive: the peer
-    /// assumed to use `default_max_ack_delay`, and this endpoint `max_ack_delay`
-    pub(super) fn new(default_max_ack_delay: Duration, max_ack_delay: Duration) -> Self {
+    /// assumed to use `default_max_ack_delay`, and this endpoint `max_ack_delay`, letting the
+    /// peer request down to `min_ack_delay`
+    pub(super) fn new(
+        default_max_ack_delay: Duration,
+        max_ack_delay: Duration,
+        min_ack_delay: Duration,
+    ) -> Self {
         Self {
             in_flight_ack_frequency_frame: None,
             next_outgoing_sequence_number: VarInt(0),
@@ -31,6 +38,7 @@ impl AckFrequencyState {
 
             last_ack_frequency_frame: None,
             max_ack_delay,
+            min_ack_delay,
         }
     }
 
@@ -137,12 +145,12 @@ impl AckFrequencyState {
 
         // Update max_ack_delay
         let max_ack_delay = Duration::from_micros(frame.request_max_ack_delay.into_inner());
-        if max_ack_delay < TIMER_GRANULARITY {
+        if max_ack_delay < self.min_ack_delay {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "Requested Max Ack Delay in ACK_FREQUENCY frame is less than min_ack_delay",
             ));
         }
-        self.max_ack_delay = max_ack_delay;
+        self.max_ack_delay = Ord::max(max_ack_delay, TIMER_GRANULARITY);
 
         // Update the rest of the params
         pending_acks.set_ack_frequency_params(frame);
@@ -177,7 +185,11 @@ mod tests {
         params.write(&mut encoded);
         let params = TransportParameters::read(Side::Client, &mut encoded.as_slice())
             .expect("peer parameters must pass wire-level validation");
-        let state = AckFrequencyState::new(Duration::from_millis(100), Duration::from_millis(100));
+        let state = AckFrequencyState::new(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            TIMER_GRANULARITY,
+        );
         let delay = state.candidate_max_ack_delay(
             Duration::from_millis(5),
             &AckFrequencyConfig::default(),
@@ -197,7 +209,11 @@ mod tests {
         params.write(&mut encoded);
         let params = TransportParameters::read(Side::Client, &mut encoded.as_slice())
             .expect("peer parameters must pass wire-level validation");
-        let state = AckFrequencyState::new(Duration::from_millis(100), Duration::from_millis(100));
+        let state = AckFrequencyState::new(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            TIMER_GRANULARITY,
+        );
         let delay = state.candidate_max_ack_delay(
             Duration::from_millis(5),
             &AckFrequencyConfig::default(),

@@ -356,6 +356,7 @@ impl Connection {
             ack_frequency: AckFrequencyState::new(
                 get_max_ack_delay(&TransportParameters::default()),
                 config.max_ack_delay,
+                config.min_ack_delay,
             ),
             next_bundled_ack_time: None,
 
@@ -371,7 +372,7 @@ impl Connection {
                 config.max_concurrent_bidi_streams,
                 config.send_window,
                 config.receive_window,
-                config.stream_receive_window,
+                config.stream_receive_windows(),
             ),
             datagrams: DatagramState::default(),
             rem_cids: CidQueue::new(rem_cid, config.active_connection_id_limit as usize),

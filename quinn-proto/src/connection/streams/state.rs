@@ -15,6 +15,7 @@ use super::{
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
+    config::StreamReceiveWindows,
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
@@ -127,8 +128,9 @@ pub struct StreamsState {
     ///
     /// Note this may be less than `buffered_data` if the user has set a new value.
     pub(super) send_window: u64,
-    /// Configured upper bound for how much unacked data the peer can send us per stream
-    pub(super) stream_receive_window: u64,
+    /// Configured upper bound for how much unacked data the peer can send us per stream, by
+    /// stream kind
+    pub(super) stream_receive_window: StreamReceiveWindows,
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -151,7 +153,7 @@ impl StreamsState {
         max_remote_bi: VarInt,
         send_window: u64,
         receive_window: VarInt,
-        stream_receive_window: VarInt,
+        stream_receive_window: impl Into<StreamReceiveWindows>,
     ) -> Self {
         let mut this = Self {
             side,
@@ -267,11 +269,9 @@ impl StreamsState {
             debug!("received illegal STREAM frame");
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window.of(self.side, id),
+        )) {
             Some(rs) => rs,
             None => {
                 trace!("dropping frame for closed stream");
@@ -320,11 +320,9 @@ impl StreamsState {
             debug!("received illegal RESET_STREAM frame");
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window.of(self.side, id),
+        )) {
             Some(stream) => stream,
             None => {
                 trace!("received RESET_STREAM on closed stream");
@@ -529,7 +527,7 @@ impl StreamsState {
             }
             retransmits.get_or_create().max_stream_data.insert(id);
 
-            let (max, _) = rs.max_stream_data(self.stream_receive_window);
+            let (max, _) = rs.max_stream_data(self.stream_receive_window.of(self.side, id));
             rs.record_sent_max_stream_data(max);
 
             trace!(stream = %id, max = max, "MAX_STREAM_DATA");
@@ -1004,7 +1002,8 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.free_recv.push(recv.free(self.stream_receive_window));
+        self.free_recv
+            .push(recv.free(self.stream_receive_window.of(self.side, id)));
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -1033,7 +1032,10 @@ pub(super) fn get_or_insert_recv(
 ) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
     move |opt| {
         *opt = opt.take().map(|s| match s {
-            StreamRecv::Free(recv) => StreamRecv::Open(recv),
+            StreamRecv::Free(mut recv) => {
+                recv.sent_max_stream_data = initial_max_data;
+                StreamRecv::Open(recv)
+            }
             s => s,
         });
         opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
@@ -1058,7 +1060,7 @@ mod tests {
             128u32.into(),
             1024 * 1024,
             (1024 * 1024u32).into(),
-            (1024 * 1024u32).into(),
+            VarInt::from_u32(1024 * 1024),
         )
     }
 
@@ -1204,7 +1206,7 @@ mod tests {
             1u32.into(),
             1024 * 1024,
             (1024 * 1024u32).into(),
-            (1024 * 1024u32).into(),
+            VarInt::from_u32(1024 * 1024),
         );
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         let initial_max = client.local_max_data;

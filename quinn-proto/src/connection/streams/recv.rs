@@ -15,7 +15,7 @@ pub(super) struct Recv {
     // NB: when adding or removing fields, remember to update `reinit`.
     state: RecvState,
     pub(super) assembler: Assembler,
-    sent_max_stream_data: u64,
+    pub(super) sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
 }
@@ -265,11 +265,14 @@ impl<'a> Chunks<'a> {
             Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
         };
 
-        let mut recv =
-            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
-                true => return Err(ReadableError::ClosedStream),
-                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
-            };
+        let mut recv = match get_or_insert_recv(streams.stream_receive_window.of(streams.side, id))(
+            entry.get_mut(),
+        )
+        .stopped
+        {
+            true => return Err(ReadableError::ClosedStream),
+            false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
+        };
 
         recv.assembler.ensure_ordering(ordered)?;
         Ok(Self {
@@ -362,7 +365,11 @@ impl<'a> Chunks<'a> {
 
         // If the stream hasn't finished, we may need to issue stream-level flow control credit
         if let ChunksState::Readable(mut rs) = state {
-            let (_, max_stream_data) = rs.max_stream_data(self.streams.stream_receive_window);
+            let (_, max_stream_data) = rs.max_stream_data(
+                self.streams
+                    .stream_receive_window
+                    .of(self.streams.side, self.id),
+            );
             should_transmit |= max_stream_data.0;
             if max_stream_data.0 {
                 self.pending.max_stream_data.insert(self.id);

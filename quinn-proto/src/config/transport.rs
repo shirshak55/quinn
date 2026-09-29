@@ -8,8 +8,9 @@ use qlog::streamer::QlogStreamer;
 #[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{
-    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, MIN_INITIAL_SIZE, VarInt, VarIntBoundsExceeded,
-    cid_queue::CidQueue, congestion, connection::qlog::QlogSink,
+    Dir, Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, MIN_INITIAL_SIZE, Side, StreamId,
+    TIMER_GRANULARITY, VarInt, VarIntBoundsExceeded, cid_queue::CidQueue, congestion,
+    connection::qlog::QlogSink,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -29,6 +30,9 @@ pub struct TransportConfig {
     pub(crate) max_concurrent_uni_streams: VarInt,
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
+    pub(crate) stream_receive_window_bidi_local: Option<VarInt>,
+    pub(crate) stream_receive_window_bidi_remote: Option<VarInt>,
+    pub(crate) stream_receive_window_uni: Option<VarInt>,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
@@ -45,6 +49,7 @@ pub struct TransportConfig {
     pub(crate) active_connection_id_limit: u32,
     pub(crate) ack_delay_exponent: u8,
     pub(crate) max_ack_delay: Duration,
+    pub(crate) min_ack_delay: Duration,
     pub(crate) min_packet_number_len: u8,
     pub(crate) early_key_update: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
@@ -121,6 +126,55 @@ impl TransportConfig {
     pub fn stream_receive_window(&mut self, value: VarInt) -> &mut Self {
         self.stream_receive_window = value;
         self
+    }
+
+    /// [`stream_receive_window`](Self::stream_receive_window) for the bidirectional streams
+    /// this endpoint opens, which it advertises as its initial_max_stream_data_bidi_local
+    /// transport parameter
+    ///
+    /// Defaults to `None`: the common `stream_receive_window`.
+    pub fn stream_receive_window_bidi_local(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_bidi_local = value;
+        self
+    }
+
+    /// [`stream_receive_window`](Self::stream_receive_window) for the bidirectional streams
+    /// the peer opens, which it advertises as its initial_max_stream_data_bidi_remote
+    /// transport parameter
+    ///
+    /// Defaults to `None`: the common `stream_receive_window`.
+    pub fn stream_receive_window_bidi_remote(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_bidi_remote = value;
+        self
+    }
+
+    /// [`stream_receive_window`](Self::stream_receive_window) for the unidirectional streams
+    /// the peer opens, which it advertises as its initial_max_stream_data_uni transport
+    /// parameter
+    ///
+    /// Defaults to `None`: the common `stream_receive_window`.
+    pub fn stream_receive_window_uni(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_uni = value;
+        self
+    }
+
+    /// The per-stream receive windows by stream kind (see
+    /// [`stream_receive_window`](Self::stream_receive_window))
+    pub(crate) fn stream_receive_windows(&self) -> StreamReceiveWindows {
+        StreamReceiveWindows {
+            bidi_local: self
+                .stream_receive_window_bidi_local
+                .unwrap_or(self.stream_receive_window)
+                .into(),
+            bidi_remote: self
+                .stream_receive_window_bidi_remote
+                .unwrap_or(self.stream_receive_window)
+                .into(),
+            uni: self
+                .stream_receive_window_uni
+                .unwrap_or(self.stream_receive_window)
+                .into(),
+        }
     }
 
     /// Maximum number of bytes the peer may transmit across all streams of a connection before
@@ -311,6 +365,18 @@ impl TransportConfig {
         self
     }
 
+    /// The shortest acknowledgement delay this endpoint lets the peer request with an
+    /// ACK_FREQUENCY frame, which it advertises as its min_ack_delay transport parameter (in
+    /// microseconds)
+    ///
+    /// Defaults to the timer granularity (1 ms). Values are truncated to microseconds and
+    /// clamped to `1..=2^24` µs; a request below the timer granularity is honoured at the
+    /// granularity.
+    pub fn min_ack_delay(&mut self, value: Duration) -> &mut Self {
+        self.min_ack_delay = Duration::from_micros(value.as_micros().clamp(1, 1 << 24) as u64);
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -435,6 +501,38 @@ impl TransportConfig {
     }
 }
 
+/// The per-stream receive windows of a [`TransportConfig`], by stream kind: the limits it
+/// advertises as initial_max_stream_data_bidi_local, initial_max_stream_data_bidi_remote and
+/// initial_max_stream_data_uni
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct StreamReceiveWindows {
+    pub(crate) bidi_local: u64,
+    pub(crate) bidi_remote: u64,
+    pub(crate) uni: u64,
+}
+
+impl StreamReceiveWindows {
+    /// The window of stream `id` at an endpoint on `side`
+    pub(crate) fn of(&self, side: Side, id: StreamId) -> u64 {
+        match (id.dir(), id.initiator() == side) {
+            (Dir::Bi, true) => self.bidi_local,
+            (Dir::Bi, false) => self.bidi_remote,
+            (Dir::Uni, _) => self.uni,
+        }
+    }
+}
+
+impl From<VarInt> for StreamReceiveWindows {
+    fn from(window: VarInt) -> Self {
+        let window = window.into();
+        Self {
+            bidi_local: window,
+            bidi_remote: window,
+            uni: window,
+        }
+    }
+}
+
 impl Default for TransportConfig {
     fn default() -> Self {
         const EXPECTED_RTT: u32 = 100; // ms
@@ -449,6 +547,9 @@ impl Default for TransportConfig {
             // 30 second default recommended by RFC 9308 § 3.2
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
+            stream_receive_window_bidi_local: None,
+            stream_receive_window_bidi_remote: None,
+            stream_receive_window_uni: None,
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
@@ -465,6 +566,7 @@ impl Default for TransportConfig {
             active_connection_id_limit: CidQueue::LEN as u32,
             ack_delay_exponent: 3,
             max_ack_delay: Duration::from_millis(25),
+            min_ack_delay: TIMER_GRANULARITY,
             min_packet_number_len: 1,
             early_key_update: true,
             ack_frequency_config: None,
@@ -494,6 +596,9 @@ impl fmt::Debug for TransportConfig {
             max_concurrent_uni_streams,
             max_idle_timeout,
             stream_receive_window,
+            stream_receive_window_bidi_local,
+            stream_receive_window_bidi_remote,
+            stream_receive_window_uni,
             receive_window,
             send_window,
             send_fairness,
@@ -509,6 +614,7 @@ impl fmt::Debug for TransportConfig {
             active_connection_id_limit,
             ack_delay_exponent,
             max_ack_delay,
+            min_ack_delay,
             min_packet_number_len,
             early_key_update,
             ack_frequency_config,
@@ -530,6 +636,15 @@ impl fmt::Debug for TransportConfig {
             .field("max_concurrent_uni_streams", max_concurrent_uni_streams)
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
+            .field(
+                "stream_receive_window_bidi_local",
+                stream_receive_window_bidi_local,
+            )
+            .field(
+                "stream_receive_window_bidi_remote",
+                stream_receive_window_bidi_remote,
+            )
+            .field("stream_receive_window_uni", stream_receive_window_uni)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
@@ -545,6 +660,7 @@ impl fmt::Debug for TransportConfig {
             .field("active_connection_id_limit", active_connection_id_limit)
             .field("ack_delay_exponent", ack_delay_exponent)
             .field("max_ack_delay", max_ack_delay)
+            .field("min_ack_delay", min_ack_delay)
             .field("min_packet_number_len", min_packet_number_len)
             .field("early_key_update", early_key_update)
             .field("ack_frequency_config", ack_frequency_config)
