@@ -340,7 +340,10 @@ impl<'a> SendStream<'a> {
             .map(get_or_insert_send(max_send_data))
             .ok_or(ClosedStream { _private: () })?;
 
-        if matches!(stream.state, SendState::ResetSent) {
+        if matches!(
+            stream.state,
+            SendState::ResetSent | SendState::ResetAt { .. }
+        ) {
             // Redundant reset call
             return Err(ClosedStream { _private: () });
         }
@@ -353,6 +356,40 @@ impl<'a> SendStream<'a> {
         self.pending.reset_stream.push((self.id, error_code));
 
         // Don't reopen an already-closed stream we haven't forgotten yet
+        Ok(())
+    }
+
+    /// Abandon transmitting data on a stream past `reliable_size` with RESET_STREAM_AT
+    /// (draft-ietf-quic-reliable-stream-reset): the data before it is still delivered, and the
+    /// stream ends once it and the reset are acknowledged
+    ///
+    /// Resets the stream as [`reset()`](Self::reset) does if `reliable_size` is 0, or unless the
+    /// peer announced it can receive RESET_STREAM_AT. A `reliable_size` past the data written is
+    /// all of it.
+    ///
+    /// # Panics
+    /// - when applied to a receive stream
+    pub fn reset_at(&mut self, error_code: VarInt, reliable_size: u64) -> Result<(), ClosedStream> {
+        if reliable_size == 0 || !self.state.reset_stream_at {
+            return self.reset(error_code);
+        }
+        let max_send_data = self.state.max_send_data(self.id);
+        let stream = self
+            .state
+            .send
+            .get_mut(&self.id)
+            .map(get_or_insert_send(max_send_data))
+            .ok_or(ClosedStream { _private: () })?;
+
+        if !matches!(stream.state, SendState::Ready | SendState::DataSent { .. }) {
+            return Err(ClosedStream { _private: () });
+        }
+
+        // Restore the portion of the send window consumed by the data past the reliable size
+        let buffered = stream.pending.buffered();
+        stream.reset_at(reliable_size);
+        self.state.buffered_data -= buffered - stream.pending.buffered();
+        self.pending.reset_stream.push((self.id, error_code));
         Ok(())
     }
 

@@ -54,7 +54,7 @@ pub struct RecvStream {
     stream: StreamId,
     is_0rtt: bool,
     all_data_read: bool,
-    reset: Option<VarInt>,
+    reset: Option<proto::ReadError>,
 }
 
 impl RecvStream {
@@ -311,7 +311,13 @@ impl RecvStream {
                 return Poll::Ready(Err(ResetError::ZeroRttRejected));
             }
 
-            if let Some(code) = self.reset {
+            if let Some(
+                proto::ReadError::Reset(code)
+                | proto::ReadError::ResetAt {
+                    error_code: code, ..
+                },
+            ) = self.reset
+            {
                 return Poll::Ready(Ok(Some(code)));
             }
 
@@ -367,7 +373,7 @@ impl RecvStream {
         // If we stored an error during a previous call, return it now. This can happen if a
         // `read_fn` both wants to return data and also returns an error in its final stream status.
         let status = match self.reset {
-            Some(code) => ReadStatus::Failed(None, Reset(code)),
+            Some(ref reset) => ReadStatus::Failed(None, reset.clone()),
             None => {
                 let mut recv = conn.inner.recv_stream(self.stream);
                 let mut chunks = recv.read(ordered)?;
@@ -395,17 +401,26 @@ impl RecvStream {
                     Poll::Pending
                 }
             },
-            ReadStatus::Failed(read, Reset(error_code)) => match read {
-                None => {
-                    self.all_data_read = true;
-                    self.reset = Some(error_code);
-                    Poll::Ready(Err(ReadError::Reset(error_code)))
+            ReadStatus::Failed(read, reset) => {
+                self.reset = Some(reset.clone());
+                match read {
+                    None => {
+                        self.all_data_read = true;
+                        Poll::Ready(Err(match reset {
+                            Reset(error_code) => ReadError::Reset(error_code),
+                            ResetAt {
+                                error_code,
+                                reliable_size,
+                            } => ReadError::ResetAt {
+                                error_code,
+                                reliable_size,
+                            },
+                            Blocked => unreachable!("handled above"),
+                        }))
+                    }
+                    done => Poll::Ready(Ok(done)),
                 }
-                done => {
-                    self.reset = Some(error_code);
-                    Poll::Ready(Ok(done))
-                }
-            },
+            }
         }
     }
 }
@@ -558,6 +573,15 @@ pub enum ReadError {
     /// Carries an application-defined error code.
     #[error("stream reset by peer: error {0}")]
     Reset(VarInt),
+    /// The peer abandoned transmitting data on this stream past `reliable_size`, with
+    /// RESET_STREAM_AT, and all of the data before it was read
+    #[error("stream reset by peer at {reliable_size}: error {error_code}")]
+    ResetAt {
+        /// The application-defined error code
+        error_code: VarInt,
+        /// The reliable size: the stream's data before it was delivered
+        reliable_size: u64,
+    },
     /// The connection was lost
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
@@ -602,7 +626,7 @@ impl From<ReadError> for io::Error {
     fn from(x: ReadError) -> Self {
         use ReadError::*;
         let kind = match x {
-            Reset { .. } | ZeroRttRejected => io::ErrorKind::ConnectionReset,
+            Reset { .. } | ResetAt { .. } | ZeroRttRejected => io::ErrorKind::ConnectionReset,
             ConnectionLost(_) | ClosedStream => io::ErrorKind::NotConnected,
             IllegalOrderedRead => io::ErrorKind::InvalidInput,
         };

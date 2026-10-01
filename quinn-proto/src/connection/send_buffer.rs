@@ -46,6 +46,8 @@ impl SendBuffer {
         let base_offset = self.offset - self.unacked_len as u64;
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
+        // Nor data past a truncation
+        range.end = range.end.min(self.offset);
 
         self.acks.insert(range);
 
@@ -166,6 +168,26 @@ impl SendBuffer {
             unsent: self.offset,
             ..Self::default()
         };
+    }
+
+    /// Discard the data at or past `offset`, which becomes the end of the buffered data
+    pub(super) fn truncate(&mut self, offset: u64) {
+        let offset = offset.min(self.offset);
+        let mut keep = offset.saturating_sub(self.offset - self.unacked_len as u64) as usize;
+        self.unacked_len = keep;
+        self.unacked_segments.retain_mut(|segment| {
+            let len = segment.len().min(keep);
+            segment.truncate(len);
+            keep -= len;
+            len > 0
+        });
+        if self.unacked_segments.is_empty() {
+            self.front_trimmed = 0;
+        }
+        self.offset = offset;
+        self.unsent = self.unsent.min(offset);
+        self.acks.remove(offset..u64::MAX);
+        self.retransmits.remove(offset..u64::MAX);
     }
 
     /// Queue a range of sent but unacknowledged data to be retransmitted

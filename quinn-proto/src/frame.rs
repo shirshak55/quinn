@@ -874,6 +874,20 @@ pub(crate) struct ResetStreamAt {
     pub(crate) reliable_size: u64,
 }
 
+impl FrameStruct for ResetStreamAt {
+    const SIZE_BOUND: usize = 1 + 8 + 8 + 8 + 8;
+}
+
+impl ResetStreamAt {
+    pub(crate) fn encode<W: BufMut>(&self, out: &mut W) {
+        out.write(FrameType::RESET_STREAM_AT); // 1 byte
+        out.write(self.reset.id); // <= 8 bytes
+        out.write(self.reset.error_code); // <= 8 bytes
+        out.write(self.reset.final_offset); // <= 8 bytes
+        out.write_var(self.reliable_size); // <= 8 bytes
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct StopSending {
     pub(crate) id: StreamId,

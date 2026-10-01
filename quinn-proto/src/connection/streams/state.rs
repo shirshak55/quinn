@@ -136,6 +136,8 @@ pub struct StreamsState {
     initial_max_stream_data_uni: VarInt,
     initial_max_stream_data_bidi_local: VarInt,
     initial_max_stream_data_bidi_remote: VarInt,
+    /// Whether the peer announced it can receive RESET_STREAM_AT frames
+    pub(super) reset_stream_at: bool,
 
     /// The shrink to be applied to local_max_data when receive_window is shrunk
     receive_window_shrink_debt: u64,
@@ -186,6 +188,7 @@ impl StreamsState {
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
+            reset_stream_at: false,
             receive_window_shrink_debt: 0,
             data_blocked_limit: None,
         };
@@ -205,6 +208,7 @@ impl StreamsState {
         self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
         self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
         self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
+        self.reset_stream_at = params.reset_stream_at;
         self.received_max_data(params.initial_max_data);
         for i in 0..self.max_remote[Dir::Bi as usize] {
             let id = StreamId::new(!self.side, Dir::Bi, i);
@@ -394,8 +398,9 @@ impl StreamsState {
             }
         };
 
-        // A stream with no data left to deliver resets as on RESET_STREAM
-        if rs.stopped || !rs.is_receiving() || rs.assembler.has_read_to(reliable_size) {
+        // A stream with no data left to deliver resets as on RESET_STREAM, as does a reliable size
+        // of 0
+        if rs.stopped || !rs.is_receiving() || reliable_size == 0 {
             return self.received_reset(reset);
         }
         let new_bytes = rs.reset_at(
@@ -433,8 +438,8 @@ impl StreamsState {
     pub(crate) fn reset_acked(&mut self, id: StreamId) {
         match self.send.entry(id) {
             hash_map::Entry::Vacant(_) => {}
-            hash_map::Entry::Occupied(e) => {
-                if let Some(SendState::ResetSent) = e.get().as_ref().map(|s| s.state) {
+            hash_map::Entry::Occupied(mut e) => {
+                if e.get_mut().as_mut().is_some_and(|s| s.reset_acked()) {
                     e.remove_entry();
                     self.stream_freed(id, StreamHalf::Send);
                 }
@@ -449,7 +454,7 @@ impl StreamsState {
             self.send
                 .get(&stream.id)
                 .and_then(|s| s.as_ref())
-                .is_some_and(|s| !s.is_reset())
+                .is_some_and(|s| !s.is_reset() && s.is_pending())
         })
     }
 
@@ -496,6 +501,29 @@ impl StreamsState {
                 Some(x) => x,
                 None => continue,
             };
+            if let SendState::ResetAt { final_size, .. } = stream.state {
+                if buf.len() + frame::ResetStreamAt::SIZE_BOUND >= max_size {
+                    pending.reset_stream.push((id, error_code));
+                    break;
+                }
+                trace!(stream = %id, "RESET_STREAM_AT");
+                retransmits
+                    .get_or_create()
+                    .reset_stream
+                    .push((id, error_code));
+                frame::ResetStreamAt {
+                    reset: frame::ResetStream {
+                        id,
+                        error_code,
+                        final_offset: VarInt::try_from(final_size)
+                            .expect("impossibly large offset"),
+                    },
+                    reliable_size: stream.pending.offset(),
+                }
+                .encode(buf);
+                stats.reset_stream_at += 1;
+                continue;
+            }
             trace!(stream = %id, "RESET_STREAM");
             retransmits
                 .get_or_create()
@@ -670,8 +698,8 @@ impl StreamsState {
 
             // Reset streams aren't removed from the pending list and still exist while the peer
             // hasn't acknowledged the reset, but should not generate STREAM frames, so we need to
-            // check for them explicitly.
-            if stream.is_reset() {
+            // check for them explicitly. Nor does a RESET_STREAM_AT's past its reliable size.
+            if stream.is_reset() || !stream.is_pending() {
                 continue;
             }
 
@@ -764,12 +792,15 @@ impl StreamsState {
             return;
         }
 
+        let reset = matches!(stream.state, SendState::ResetAt { .. });
         entry.remove_entry();
         self.stream_freed(id, StreamHalf::Send);
-        self.events.push_back(StreamEvent::Finished { id });
+        if !reset {
+            self.events.push_back(StreamEvent::Finished { id });
+        }
     }
 
-    pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) {
+    pub(crate) fn retransmit(&mut self, mut frame: frame::StreamMeta) {
         let stream = match self.send.get_mut(&frame.id).and_then(|s| s.as_mut()) {
             // Loss of data on a closed stream is a noop
             None => return,
@@ -777,6 +808,14 @@ impl StreamsState {
         };
         if stream.is_reset() {
             return;
+        }
+        // A RESET_STREAM_AT's stream sends again only the data before its reliable size
+        if let SendState::ResetAt { .. } = stream.state {
+            frame.offsets.end = frame.offsets.end.min(stream.pending.offset());
+            frame.fin = false;
+            if frame.offsets.is_empty() {
+                return;
+            }
         }
         if !stream.is_pending() {
             self.pending.push_pending(frame.id, stream.priority);

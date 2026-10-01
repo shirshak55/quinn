@@ -210,6 +210,27 @@ impl SendStream {
         Ok(())
     }
 
+    /// Close the send stream immediately past `reliable_size` with RESET_STREAM_AT
+    /// (draft-ietf-quic-reliable-stream-reset)
+    ///
+    /// No new data can be written after calling this method. The data before `reliable_size` is
+    /// still delivered (retransmitted if lost), and the data past it dropped. A plain
+    /// [`reset()`](Self::reset) if `reliable_size` is 0, or unless the peer announced it can
+    /// receive RESET_STREAM_AT.
+    ///
+    /// May fail as [`reset()`](Self::reset) may.
+    pub fn reset_at(&mut self, error_code: VarInt, reliable_size: u64) -> Result<(), ClosedStream> {
+        let mut conn = self.conn.state.lock("SendStream::reset_at");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Ok(());
+        }
+        conn.inner
+            .send_stream(self.stream)
+            .reset_at(error_code, reliable_size)?;
+        conn.wake();
+        Ok(())
+    }
+
     /// Set the priority of the send stream
     ///
     /// Every send stream has an initial priority of 0. Locally buffered data from streams with

@@ -88,6 +88,11 @@ macro_rules! make_struct {
             /// Frequency
             pub(crate) min_ack_delay: Option<VarInt>,
 
+            /// The endpoint can receive RESET_STREAM_AT frames (draft-ietf-quic-reliable-stream-reset)
+            ///
+            /// Only read: quinn doesn't send this parameter.
+            pub(crate) reset_stream_at: bool,
+
             // Server-only
             /// The value of the Destination Connection ID field from the first Initial packet sent
             /// by the client
@@ -125,6 +130,7 @@ macro_rules! make_struct {
                     initial_src_cid: None,
                     grease_quic_bit: false,
                     min_ack_delay: None,
+                    reset_stream_at: false,
 
                     original_dst_cid: None,
                     retry_src_cid: None,
@@ -437,6 +443,9 @@ impl TransportParameters {
             }
             let len = len as usize;
             let Ok(id) = TransportParameterId::try_from(id) else {
+                // reset_stream_at, as draft-ietf-quic-reliable-stream-reset-08 and its drafts 05
+                // to 07 number it
+                params.reset_stream_at |= matches!(id, 0x1d | 0x17f7586d2cb571);
                 // unknown transport parameters are ignored
                 r.advance(len);
                 continue;

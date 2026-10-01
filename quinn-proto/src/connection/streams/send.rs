@@ -98,6 +98,38 @@ impl Send {
         }
     }
 
+    /// Update stream state due to a RESET_STREAM_AT sent by the local application: only the data
+    /// before `reliable_size` is still sent
+    pub(super) fn reset_at(&mut self, reliable_size: u64) {
+        use SendState::*;
+        if let DataSent { .. } | Ready = self.state {
+            self.state = ResetAt {
+                final_size: self.pending.offset(),
+                reset_acked: false,
+            };
+            self.pending.truncate(reliable_size);
+            self.fin_pending = false;
+        }
+    }
+
+    /// Handle the acknowledgement of a reset this stream sent
+    ///
+    /// Returns whether the stream is done: a RESET_STREAM_AT's once the data before its reliable
+    /// size is acknowledged too
+    pub(super) fn reset_acked(&mut self) -> bool {
+        match self.state {
+            SendState::ResetSent => true,
+            SendState::ResetAt {
+                ref mut reset_acked,
+                ..
+            } => {
+                *reset_acked = true;
+                self.pending.is_fully_acked()
+            }
+            _ => false,
+        }
+    }
+
     /// Handle STOP_SENDING
     ///
     /// Returns true if the stream was stopped due to this frame, and false
@@ -111,7 +143,8 @@ impl Send {
         }
     }
 
-    /// Returns whether the stream has been finished and all data has been acknowledged by the peer
+    /// Returns whether the stream has been finished and all data has been acknowledged by the peer,
+    /// or its RESET_STREAM_AT and the data before its reliable size have
     pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
         self.pending.ack(frame.offsets);
         match self.state {
@@ -121,6 +154,7 @@ impl Send {
                 *finish_acked |= frame.fin;
                 *finish_acked && self.pending.is_fully_acked()
             }
+            SendState::ResetAt { reset_acked, .. } => reset_acked && self.pending.is_fully_acked(),
             _ => false,
         }
     }
@@ -137,8 +171,12 @@ impl Send {
         was_blocked
     }
 
+    /// The stream's final size so far: the offset the next write would begin at
     pub(super) fn offset(&self) -> u64 {
-        self.pending.offset()
+        match self.state {
+            SendState::ResetAt { final_size, .. } => final_size,
+            _ => self.pending.offset(),
+        }
     }
 
     pub(super) fn is_pending(&self) -> bool {
@@ -293,6 +331,9 @@ pub(super) enum SendState {
     DataSent { finish_acked: bool },
     /// Sent RESET
     ResetSent,
+    /// Sent RESET_STREAM_AT: still sending the data before its reliable size (the end of
+    /// `pending`) until all of it and the frame are acknowledged
+    ResetAt { final_size: u64, reset_acked: bool },
 }
 
 /// Reasons why attempting to finish a stream might fail
