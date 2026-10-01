@@ -2890,6 +2890,18 @@ impl Connection {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }
+                Frame::ResetStreamAt(frame) => {
+                    if !self.config.reset_stream_at {
+                        return Err(frame::InvalidFrame {
+                            ty: Some(frame::FrameType::RESET_STREAM_AT),
+                            reason: "invalid frame ID",
+                        }
+                        .into());
+                    }
+                    if self.streams.received_reset_at(frame)?.should_transmit() {
+                        self.spaces[SpaceId::Data].pending.max_data = true;
+                    }
+                }
                 Frame::DataBlocked { offset } => {
                     debug!(offset, "peer claims to be blocked at connection level");
                 }
@@ -3011,6 +3023,10 @@ impl Connection {
                     }
                 }
                 Frame::AckFrequency(ack_frequency) => {
+                    let ack_frequency = match self.config.ack_frequency_draft_00 {
+                        true => ack_frequency.decode_draft_00()?,
+                        false => ack_frequency,
+                    };
                     // This frame can only be sent in the Data space
                     let space = &mut self.spaces[SpaceId::Data];
 

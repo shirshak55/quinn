@@ -133,6 +133,8 @@ frame_types! {
     // ACK Frequency
     ACK_FREQUENCY = 0xaf,
     IMMEDIATE_ACK = 0x1f,
+    // Reliable stream reset
+    RESET_STREAM_AT = 0x24,
     // DATAGRAM
 }
 
@@ -145,6 +147,7 @@ pub(crate) enum Frame {
     Ping,
     Ack(Ack),
     ResetStream(ResetStream),
+    ResetStreamAt(ResetStreamAt),
     StopSending(StopSending),
     Crypto(Crypto),
     NewToken(NewToken),
@@ -172,6 +175,7 @@ impl Frame {
         match *self {
             Padding => FrameType::PADDING,
             ResetStream(_) => FrameType::RESET_STREAM,
+            ResetStreamAt(_) => FrameType::RESET_STREAM_AT,
             Close(self::Close::Connection(_)) => FrameType::CONNECTION_CLOSE,
             Close(self::Close::Application(_)) => FrameType::APPLICATION_CLOSE,
             MaxData(_) => FrameType::MAX_DATA,
@@ -695,6 +699,21 @@ impl Iter {
                 reordering_threshold: self.bytes.get()?,
             }),
             FrameType::IMMEDIATE_ACK => Frame::ImmediateAck,
+            FrameType::RESET_STREAM_AT => {
+                let reset = ResetStream {
+                    id: self.bytes.get()?,
+                    error_code: self.bytes.get()?,
+                    final_offset: self.bytes.get()?,
+                };
+                let reliable_size = self.bytes.get_var()?;
+                if reliable_size > reset.final_offset.into_inner() {
+                    return Err(IterErr::Malformed);
+                }
+                Frame::ResetStreamAt(ResetStreamAt {
+                    reset,
+                    reliable_size,
+                })
+            }
             _ => {
                 if let Some(s) = ty.stream() {
                     Frame::Stream(Stream {
@@ -847,6 +866,14 @@ impl ResetStream {
     }
 }
 
+/// A RESET_STREAM_AT frame: a RESET_STREAM whose stream still delivers its data before
+/// `reliable_size`
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct ResetStreamAt {
+    pub(crate) reset: ResetStream,
+    pub(crate) reliable_size: u64,
+}
+
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct StopSending {
     pub(crate) id: StreamId,
@@ -930,6 +957,34 @@ pub(crate) struct AckFrequency {
 }
 
 impl AckFrequency {
+    /// This frame, read in the current layout, as draft-ietf-quic-ack-frequency-00 means it:
+    /// its Packet Tolerance (at least 1) counts one more packet than the Ack-Eliciting
+    /// Threshold, and its Ignore Order byte (0 or 1, read as the Reordering Threshold) set
+    /// means a Reordering Threshold of 0, unset one of 1
+    pub(crate) fn decode_draft_00(self) -> Result<Self, TransportError> {
+        let ack_eliciting_threshold = self
+            .ack_eliciting_threshold
+            .into_inner()
+            .checked_sub(1)
+            .ok_or(TransportError::FRAME_ENCODING_ERROR(
+                "zero ACK_FREQUENCY packet tolerance",
+            ))?;
+        let reordering_threshold = match self.reordering_threshold.into_inner() {
+            0 => 1,
+            1 => 0,
+            _ => {
+                return Err(TransportError::FRAME_ENCODING_ERROR(
+                    "invalid ACK_FREQUENCY Ignore Order",
+                ));
+            }
+        };
+        Ok(Self {
+            ack_eliciting_threshold: VarInt(ack_eliciting_threshold),
+            reordering_threshold: VarInt(reordering_threshold),
+            ..self
+        })
+    }
+
     pub(crate) fn encode<W: BufMut>(&self, buf: &mut W) {
         buf.write(FrameType::ACK_FREQUENCY);
         buf.write(self.sequence);

@@ -50,6 +50,8 @@ pub struct TransportConfig {
     pub(crate) ack_delay_exponent: u8,
     pub(crate) max_ack_delay: Duration,
     pub(crate) min_ack_delay: Duration,
+    pub(crate) ack_frequency_draft_00: bool,
+    pub(crate) reset_stream_at: bool,
     pub(crate) min_packet_number_len: u8,
     pub(crate) early_key_update: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
@@ -377,6 +379,28 @@ impl TransportConfig {
         self
     }
 
+    /// Whether the peer's ACK_FREQUENCY frames are laid out as draft-ietf-quic-ack-frequency-00
+    /// lays them out (a Packet Tolerance, and an Ignore Order byte), as they are for a peer
+    /// told this endpoint's min_ack_delay as that draft's transport parameter (0xff02de1a) by
+    /// a crypto session sending its own transport parameters
+    ///
+    /// Defaults to `false`: the layout of the draft quinn implements.
+    pub fn ack_frequency_draft_00(&mut self, value: bool) -> &mut Self {
+        self.ack_frequency_draft_00 = value;
+        self
+    }
+
+    /// Whether the peer may send RESET_STREAM_AT frames (draft-ietf-quic-reliable-stream-reset),
+    /// as it may once told this endpoint's reset_stream_at transport parameter by a crypto
+    /// session sending its own transport parameters (quinn doesn't send it): a stream reset
+    /// with one still delivers its data up to the frame's Reliable Size, then reports the reset
+    ///
+    /// Defaults to `false`: such a frame is a connection error, as any unknown frame type.
+    pub fn reset_stream_at(&mut self, value: bool) -> &mut Self {
+        self.reset_stream_at = value;
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -567,6 +591,8 @@ impl Default for TransportConfig {
             ack_delay_exponent: 3,
             max_ack_delay: Duration::from_millis(25),
             min_ack_delay: TIMER_GRANULARITY,
+            ack_frequency_draft_00: false,
+            reset_stream_at: false,
             min_packet_number_len: 1,
             early_key_update: true,
             ack_frequency_config: None,
@@ -615,6 +641,8 @@ impl fmt::Debug for TransportConfig {
             ack_delay_exponent,
             max_ack_delay,
             min_ack_delay,
+            ack_frequency_draft_00,
+            reset_stream_at,
             min_packet_number_len,
             early_key_update,
             ack_frequency_config,
@@ -661,6 +689,8 @@ impl fmt::Debug for TransportConfig {
             .field("ack_delay_exponent", ack_delay_exponent)
             .field("max_ack_delay", max_ack_delay)
             .field("min_ack_delay", min_ack_delay)
+            .field("ack_frequency_draft_00", ack_frequency_draft_00)
+            .field("reset_stream_at", reset_stream_at)
             .field("min_packet_number_len", min_packet_number_len)
             .field("early_key_update", early_key_update)
             .field("ack_frequency_config", ack_frequency_config)

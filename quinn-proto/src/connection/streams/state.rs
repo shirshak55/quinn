@@ -364,6 +364,52 @@ impl StreamsState {
         })
     }
 
+    /// Process incoming RESET_STREAM_AT frame
+    ///
+    /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
+    pub(crate) fn received_reset_at(
+        &mut self,
+        frame: frame::ResetStreamAt,
+    ) -> Result<ShouldTransmit, TransportError> {
+        let frame::ResetStreamAt {
+            reset,
+            reliable_size,
+        } = frame;
+        let frame::ResetStream {
+            id,
+            error_code,
+            final_offset,
+        } = reset;
+        self.validate_receive_id(id).inspect_err(|_e| {
+            debug!("received illegal RESET_STREAM_AT frame");
+        })?;
+
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window.of(self.side, id),
+        )) {
+            Some(stream) => stream,
+            None => {
+                trace!("received RESET_STREAM_AT on closed stream");
+                return Ok(ShouldTransmit(false));
+            }
+        };
+
+        // A stream with no data left to deliver resets as on RESET_STREAM
+        if rs.stopped || !rs.is_receiving() || rs.assembler.has_read_to(reliable_size) {
+            return self.received_reset(reset);
+        }
+        let new_bytes = rs.reset_at(
+            error_code,
+            final_offset,
+            reliable_size,
+            self.data_recvd,
+            self.local_max_data,
+        )?;
+        self.data_recvd = self.data_recvd.saturating_add(new_bytes);
+        self.on_stream_frame(true, id);
+        Ok(ShouldTransmit(false))
+    }
+
     /// Process incoming `STOP_SENDING` frame
     #[allow(unreachable_pub)] // fuzzing only
     pub fn received_stop_sending(&mut self, id: StreamId, error_code: VarInt) {

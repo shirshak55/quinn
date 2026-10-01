@@ -228,6 +228,38 @@ impl Assembler {
         self.bytes_read
     }
 
+    /// Whether the application has read all of the stream before `offset`
+    pub(super) fn has_read_to(&self, offset: u64) -> bool {
+        match &self.state {
+            State::Ordered => self.bytes_read >= offset,
+            State::Unordered { recvd } => {
+                (offset == 0
+                    || recvd
+                        .peek_min()
+                        .is_some_and(|range| range.start == 0 && range.end >= offset))
+                    && self.data.iter().all(|chunk| chunk.offset >= offset)
+            }
+        }
+    }
+
+    /// Discard buffered data at or past `offset`
+    pub(super) fn truncate(&mut self, offset: u64) {
+        let data = mem::take(&mut self.data);
+        self.buffered = 0;
+        self.allocated = 0;
+        for mut chunk in data {
+            if chunk.offset >= offset {
+                continue;
+            }
+            chunk
+                .bytes
+                .truncate(usize::try_from(offset - chunk.offset).unwrap_or(usize::MAX));
+            self.buffered += chunk.bytes.len();
+            self.allocated += chunk.allocation_size;
+            self.data.push(chunk);
+        }
+    }
+
     /// Discard all buffered data
     pub(super) fn clear(&mut self) {
         self.data.clear();
