@@ -11,8 +11,7 @@ type CidData = (ConnectionId, Option<ResetToken>);
 #[derive(Debug)]
 pub(crate) struct CidQueue {
     /// The known CIDs by sequence number, the active one first: only a CID the peer issued
-    /// takes memory, so a large active connection ID limit costs nothing until used, and at
-    /// most [`Self::MAX_STORED`] are kept
+    /// takes memory, so a large active connection ID limit costs nothing until used
     cids: BTreeMap<u64, CidData>,
     /// The active connection ID limit: how far past the active CID a sequence number may be
     limit: usize,
@@ -46,15 +45,6 @@ impl CidQueue {
         if index >= self.limit as u64 + retired_count {
             return Err(InsertError::ExceedsLimit);
         }
-        // Retiring frees the active CID at least, so only a frame retiring nothing can grow
-        // the queue past the cap
-        if retired_count == 0
-            && self.cids.len() >= Self::MAX_STORED
-            && !self.cids.contains_key(&cid.sequence)
-        {
-            return Err(InsertError::ExceedsLimit);
-        }
-
         // Discard retired CIDs, if any
         if retired_count != 0 {
             self.cids = self.cids.split_off(&cid.retire_prior_to);
@@ -128,10 +118,6 @@ impl CidQueue {
 
     /// The default active connection ID limit
     pub(crate) const LEN: usize = 5;
-
-    /// The most CIDs kept, whatever the active connection ID limit: a peer issuing more than
-    /// this many at once exceeds the limit
-    pub(crate) const MAX_STORED: usize = 4096;
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
