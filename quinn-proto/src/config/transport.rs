@@ -323,9 +323,9 @@ impl TransportConfig {
     /// active_connection_id_limit transport parameter unless its own connection IDs are
     /// zero-length (then it sends none, meaning 2)
     ///
-    /// Defaults to 5. Values below 2 are raised to 2. The connection stores the peer's
-    /// connection IDs in a buffer that grows only as the peer issues them, so a large
-    /// value costs memory only when the peer uses it.
+    /// Defaults to 5. Values below 2 are raised to 2. The connection stores only the
+    /// connection IDs the peer issues, so a large value costs memory only when the peer uses
+    /// it, and never more than 4096 at once: a peer issuing more exceeds the limit.
     pub fn active_connection_id_limit(&mut self, value: u32) -> &mut Self {
         self.active_connection_id_limit = value.max(2);
         self

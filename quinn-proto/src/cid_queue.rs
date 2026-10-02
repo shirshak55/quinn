@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{collections::BTreeMap, ops::Range};
 
 use crate::{ConnectionId, ResetToken, frame::NewConnectionId};
 
@@ -10,48 +10,21 @@ type CidData = (ConnectionId, Option<ResetToken>);
 /// May contain gaps due to packet loss or reordering
 #[derive(Debug)]
 pub(crate) struct CidQueue {
-    /// Ring buffer indexed by `self.cursor`, as long as the active connection ID limit once
-    /// grown to it: it starts at [`Self::LEN`] slots and grows as the peer issues connection
-    /// IDs with higher sequence numbers, so a large advertised limit costs memory only when
-    /// the peer uses it
-    buffer: Vec<Option<CidData>>,
-    /// The active connection ID limit: the most entries `buffer` grows to
+    /// The known CIDs by sequence number, the active one first: only a CID the peer issued
+    /// takes memory, so a large active connection ID limit costs nothing until used, and at
+    /// most [`Self::MAX_STORED`] are kept
+    cids: BTreeMap<u64, CidData>,
+    /// The active connection ID limit: how far past the active CID a sequence number may be
     limit: usize,
-    /// Index at which circular buffer addressing is based
-    cursor: usize,
-    /// Sequence number of `self.buffer[cursor]`
-    ///
-    /// The sequence number of the active CID; must be the smallest among CIDs in `buffer`.
-    offset: u64,
 }
 
 impl CidQueue {
     /// A queue holding up to `limit` connection IDs, the active one first
     pub(crate) fn new(cid: ConnectionId, limit: usize) -> Self {
-        let mut buffer = vec![None; limit.min(Self::LEN)];
-        buffer[0] = Some((cid, None));
         Self {
-            buffer,
+            cids: BTreeMap::from([(0, (cid, None))]),
             limit,
-            cursor: 0,
-            offset: 0,
         }
-    }
-
-    /// Grows the ring buffer to hold a CID `index` past the active one, keeping the ring's
-    /// order from the cursor; `index` is below `self.limit`
-    fn grow_for(&mut self, index: u64) {
-        let needed = (index as usize).saturating_add(1).min(self.limit);
-        if needed <= self.buffer.len() {
-            return;
-        }
-        let len = self.buffer.len();
-        let mut buffer = vec![None; needed];
-        for step in 0..len {
-            buffer[step] = self.buffer[(self.cursor + step) % len];
-        }
-        self.buffer = buffer;
-        self.cursor = 0;
     }
 
     /// Handle a `NEW_CONNECTION_ID` frame
@@ -62,31 +35,34 @@ impl CidQueue {
         &mut self,
         cid: NewConnectionId,
     ) -> Result<Option<(Range<u64>, ResetToken)>, InsertError> {
+        let orig_offset = self.offset();
         // Position of new CID wrt. the current active CID
-        let index = match cid.sequence.checked_sub(self.offset) {
+        let index = match cid.sequence.checked_sub(orig_offset) {
             None => return Err(InsertError::Retired),
             Some(x) => x,
         };
 
-        let retired_count = cid.retire_prior_to.saturating_sub(self.offset);
+        let retired_count = cid.retire_prior_to.saturating_sub(orig_offset);
         if index >= self.limit as u64 + retired_count {
             return Err(InsertError::ExceedsLimit);
         }
-        if retired_count == 0 {
-            self.grow_for(index);
-        } else {
-            self.grow_for(index.min(self.limit as u64 - 1));
+        // Retiring frees the active CID at least, so only a frame retiring nothing can grow
+        // the queue past the cap
+        if retired_count == 0
+            && self.cids.len() >= Self::MAX_STORED
+            && !self.cids.contains_key(&cid.sequence)
+        {
+            return Err(InsertError::ExceedsLimit);
         }
 
         // Discard retired CIDs, if any
-        let len = self.buffer.len();
-        for i in 0..(retired_count.min(len as u64) as usize) {
-            self.buffer[(self.cursor + i) % len] = None;
+        if retired_count != 0 {
+            self.cids = self.cids.split_off(&cid.retire_prior_to);
         }
 
         // Record the new CID
-        let index = ((self.cursor as u64 + index) % len as u64) as usize;
-        self.buffer[index] = Some((cid.id, Some(cid.reset_token)));
+        self.cids
+            .insert(cid.sequence, (cid.id, Some(cid.reset_token)));
 
         if retired_count == 0 {
             return Ok(None);
@@ -95,22 +71,19 @@ impl CidQueue {
         // The active CID was retired. Find the first known CID with sequence number of at least
         // retire_prior_to, and inform the caller that all prior CIDs have been retired, and of
         // the new CID's reset token.
-        self.cursor = ((self.cursor as u64 + retired_count) % len as u64) as usize;
-        let (i, (_, token)) = self
+        let (_, token) = self
             .iter()
             .next()
-            .expect("it is impossible to retire a CID without supplying a new one");
-        self.cursor = (self.cursor + i) % len;
-        let orig_offset = self.offset;
-        self.offset = cid.retire_prior_to + i as u64;
+            .expect("it is impossible to retire a CID without supplying a new one")
+            .1;
         // We don't immediately retire CIDs in the range (orig_offset +
-        // self.buffer.len())..self.offset. These are CIDs that we haven't yet received from a
+        // self.limit)..self.offset(). These are CIDs that we haven't yet received from a
         // NEW_CONNECTION_ID frame, since having previously received them would violate the
         // connection ID limit we specified. If we do receive a such a frame
         // in the future, e.g. due to reordering, we'll retire it then. This ensures we can't be
         // made to buffer an arbitrarily large number of RETIRE_CONNECTION_ID frames.
         Ok(Some((
-            orig_offset..self.offset.min(orig_offset + len as u64),
+            orig_offset..self.offset().min(orig_offset + self.limit as u64),
             token.expect("non-initial CID missing reset token"),
         )))
     }
@@ -119,40 +92,46 @@ impl CidQueue {
     /// 1) the corresponding ResetToken and 2) a non-empty range preceding it to retire
     pub(crate) fn next(&mut self) -> Option<(ResetToken, Range<u64>)> {
         let (i, cid_data) = self.iter().nth(1)?;
-        self.buffer[self.cursor] = None;
-
-        let orig_offset = self.offset;
-        self.offset += i as u64;
-        self.cursor = (self.cursor + i) % self.buffer.len();
-        Some((cid_data.1.unwrap(), orig_offset..self.offset))
+        let orig_offset = self.offset();
+        self.cids.remove(&orig_offset);
+        Some((cid_data.1.unwrap(), orig_offset..orig_offset + i as u64))
     }
 
-    /// Iterate CIDs in CidQueue that are not `None`, including the active CID
+    /// Iterate CIDs in CidQueue, including the active CID, each with its distance from it
     fn iter(&self) -> impl Iterator<Item = (usize, CidData)> + '_ {
-        (0..self.buffer.len()).filter_map(move |step| {
-            let index = (self.cursor + step) % self.buffer.len();
-            self.buffer[index].map(|cid_data| (step, cid_data))
-        })
+        let offset = self.offset();
+        self.cids
+            .iter()
+            .map(move |(&seq, &cid_data)| ((seq - offset) as usize, cid_data))
     }
 
     /// Replace the initial CID
     pub(crate) fn update_initial_cid(&mut self, cid: ConnectionId) {
-        debug_assert_eq!(self.offset, 0);
-        self.buffer[self.cursor] = Some((cid, None));
+        debug_assert_eq!(self.offset(), 0);
+        self.cids.insert(0, (cid, None));
     }
 
     /// Return active remote CID itself
     pub(crate) fn active(&self) -> ConnectionId {
-        self.buffer[self.cursor].unwrap().0
+        self.cids.values().next().unwrap().0
     }
 
     /// Return the sequence number of active remote CID
     pub(crate) fn active_seq(&self) -> u64 {
-        self.offset
+        self.offset()
+    }
+
+    /// Sequence number of the active CID, the smallest in `cids`
+    fn offset(&self) -> u64 {
+        *self.cids.keys().next().unwrap()
     }
 
     /// The default active connection ID limit
     pub(crate) const LEN: usize = 5;
+
+    /// The most CIDs kept, whatever the active connection ID limit: a peer issuing more than
+    /// this many at once exceeds the limit
+    pub(crate) const MAX_STORED: usize = 4096;
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
