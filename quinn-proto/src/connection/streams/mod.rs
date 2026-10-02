@@ -50,6 +50,7 @@ impl<'a> Streams<'a> {
 
         // TODO: Queue STREAM_ID_BLOCKED if this fails
         if self.state.next[dir as usize] >= self.state.max[dir as usize] {
+            self.state.open_blocked[dir as usize] = true;
             return None;
         }
 

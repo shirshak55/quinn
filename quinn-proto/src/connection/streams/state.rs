@@ -77,6 +77,10 @@ pub struct StreamsState {
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
     pub(super) max: [u64; 2],
+    /// Whether opening a locally-initiated stream failed for `max`, per direction: a server
+    /// sending 0.5-RTT data may try before a HelloRetryRequest's second ClientHello brings the
+    /// peer's limits
+    pub(super) open_blocked: [bool; 2],
     /// Maximum number of remotely-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
     pub(super) max_remote: [u64; 2],
@@ -164,6 +168,7 @@ impl StreamsState {
             free_recv: Vec::new(),
             next: [0, 0],
             max: [0, 0],
+            open_blocked: [false, false],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
             sent_max_remote: [max_remote_bi.into(), max_remote_uni.into()],
             allocated_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
@@ -206,8 +211,16 @@ impl StreamsState {
         self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
         self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
         self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
-        self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
-        self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
+        for (dir, count) in [
+            (Dir::Bi, params.initial_max_streams_bidi),
+            (Dir::Uni, params.initial_max_streams_uni),
+        ] {
+            let count = count.into();
+            if count > self.max[dir as usize] && mem::take(&mut self.open_blocked[dir as usize]) {
+                self.events.push_back(StreamEvent::Available { dir });
+            }
+            self.max[dir as usize] = count;
+        }
         self.reset_stream_at = params.reset_stream_at;
         self.received_max_data(params.initial_max_data);
         for i in 0..self.max_remote[Dir::Bi as usize] {
