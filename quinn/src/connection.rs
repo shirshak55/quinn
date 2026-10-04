@@ -702,6 +702,20 @@ impl Connection {
         conn.wake();
     }
 
+    /// Drop the connection's state as [`Self::abandon`] does, answering the peer's last packet
+    /// with a stateless reset
+    ///
+    /// See [`proto::Connection::abandon_with_reset()`].
+    pub fn abandon_with_reset(&self) {
+        let conn = &mut *self.0.state.lock("abandon_with_reset");
+        if conn.error.is_some() {
+            return;
+        }
+        conn.inner.abandon_with_reset();
+        conn.terminate(ConnectionError::LocallyClosed, &self.0.shared);
+        conn.wake();
+    }
+
     /// Update traffic keys spontaneously
     ///
     /// This primarily exists for testing purposes.

@@ -24,6 +24,7 @@ use crate::{
     compatible_versions,
     config::{ServerConfig, TransportConfig},
     crypto::{self, KeyPair, Keys, PacketKey},
+    endpoint::write_stateless_reset,
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
         FIXED_BIT, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType,
@@ -248,6 +249,10 @@ pub struct Connection {
     sent_flight: Option<FirstFlight>,
     /// Whether the connection stopped answering the peer (see [`Self::fall_silent`])
     silent: bool,
+    /// The destination CID and length of the peer's last authenticated packet
+    last_received: Option<(ConnectionId, usize)>,
+    /// The stateless reset answering it, left to send (see [`Self::abandon_with_reset`])
+    reset_pending: Option<(ConnectionId, usize)>,
     /// Whether packets may clear the QUIC bit when the peer announced grease_quic_bit (see
     /// [`Self::set_send_greased_quic_bit`])
     send_greased_quic_bit: bool,
@@ -430,6 +435,8 @@ impl Connection {
             stats: ConnectionStats::default(),
             sent_flight,
             silent: false,
+            last_received: None,
+            reset_pending: None,
             greased_packets_received: 0,
             version,
             orig_version: version,
@@ -541,6 +548,19 @@ impl Connection {
         assert!(max_datagrams != 0);
         if self.silent {
             return None;
+        }
+        if let Some((cid, inciting_len)) = self.reset_pending.take() {
+            let key = &*self.endpoint_config.reset_key;
+            if !write_stateless_reset(&mut self.rng, key, cid, inciting_len, buf) {
+                return None;
+            }
+            return Some(Transmit {
+                destination: self.path.remote,
+                ecn: None,
+                size: buf.len(),
+                segment_size: None,
+                src_ip: self.local_ip,
+            });
         }
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
@@ -1449,6 +1469,16 @@ impl Connection {
     /// endpoint answers the peer's later packets with stateless resets
     pub fn abandon(&mut self) {
         if !self.state.is_drained() {
+            self.kill(ConnectionError::LocallyClosed);
+        }
+    }
+
+    /// Drop the connection's state as [`Self::abandon`] does, answering the peer's last packet
+    /// with the stateless reset the endpoint answers later ones with, as an endpoint that lost
+    /// the state before that packet arrived
+    pub fn abandon_with_reset(&mut self) {
+        if !self.state.is_drained() {
+            self.reset_pending = self.last_received;
             self.kill(ConnectionError::LocallyClosed);
         }
     }
@@ -2635,6 +2665,8 @@ impl Connection {
                     None => trace_span!("recv", space = ?packet.header.space()),
                 };
                 let _guard = span.enter();
+                let len = packet.header_data.len() + packet.payload.len();
+                self.last_received = Some((packet.header.dst_cid(), len));
 
                 let is_duplicate = |n| self.spaces[packet.header.space()].dedup.insert(n);
                 if number.is_some_and(is_duplicate) {
