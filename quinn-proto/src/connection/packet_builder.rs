@@ -142,9 +142,7 @@ impl PacketBuilder {
             }
         }
         let partial_encode = header.encode(buffer);
-        if conn.peer_params.grease_quic_bit
-            && conn.config.send_greased_quic_bit
-            && conn.rng.random()
+        if conn.peer_params.grease_quic_bit && conn.send_greased_quic_bit && conn.rng.random()
         {
             buffer[partial_encode.start] ^= FIXED_BIT;
         }

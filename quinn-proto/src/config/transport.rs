@@ -383,7 +383,8 @@ impl TransportConfig {
     }
 
     /// Whether to grease the QUIC bit (RFC 9287) of the packets sent, clearing it at random, where
-    /// the peer announced grease_quic_bit
+    /// the peer announced grease_quic_bit; a connection's changes with
+    /// [`Connection::set_send_greased_quic_bit`](crate::Connection::set_send_greased_quic_bit)
     ///
     /// Defaults to `true`.
     pub fn send_greased_quic_bit(&mut self, value: bool) -> &mut Self {

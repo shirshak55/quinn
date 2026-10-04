@@ -283,6 +283,7 @@ impl Future for ConnectionDriver {
         conn.forward_app_events(&self.conn.shared);
         conn.forward_stream_concurrency(&self.conn.shared);
         conn.forward_pings(&self.conn.shared);
+        conn.forward_greased_packets(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -656,6 +657,35 @@ impl Connection {
         let mut conn = self.0.state.lock("fall_silent");
         conn.inner.fall_silent();
         conn.wake();
+    }
+
+    /// Whether the packets sent from now on may clear the QUIC bit
+    ///
+    /// See [`proto::Connection::set_send_greased_quic_bit()`].
+    pub fn set_send_greased_quic_bit(&self, value: bool) {
+        self.0
+            .state
+            .lock("set_send_greased_quic_bit")
+            .inner
+            .set_send_greased_quic_bit(value);
+    }
+
+    /// How many of the peer's packets cleared the QUIC bit
+    ///
+    /// See [`proto::Connection::greased_packets_received()`].
+    pub fn greased_packets_received(&self) -> u64 {
+        self.0
+            .state
+            .lock("greased_packets_received")
+            .inner
+            .greased_packets_received()
+    }
+
+    /// Resolves once a packet from the peer clearing the QUIC bit arrived
+    ///
+    /// One arriving after this is called wakes it, so it is called before reading the count.
+    pub fn greased_packet_received(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.0.shared.greased_packet_received.notified()
     }
 
     /// Drop the connection's state without telling the peer, ending it with
@@ -1091,6 +1121,7 @@ impl ConnectionRef {
                 buffered_transmit: None,
                 stream_concurrency: [[0; 3]; 2],
                 pings: 0,
+                greased_packets: 0,
             }),
             shared: Shared::default(),
         }))
@@ -1153,6 +1184,8 @@ pub(crate) struct Shared {
     stream_concurrency_changed: Notify,
     /// Notified when the driver sees a PING frame from the peer arrive
     ping_received: Notify,
+    /// Notified when the driver sees a packet clearing the QUIC bit arrive
+    greased_packet_received: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
 }
@@ -1186,6 +1219,8 @@ pub(crate) struct State {
     stream_concurrency: [[u64; 3]; 2],
     /// How many PING frames from the peer the driver last saw arrived
     pings: u64,
+    /// How many of the peer's packets clearing the QUIC bit the driver last saw arrived
+    greased_packets: u64,
 }
 
 impl State {
@@ -1318,6 +1353,15 @@ impl State {
         if pings != self.pings {
             self.pings = pings;
             shared.ping_received.notify_waiters();
+        }
+    }
+
+    /// Wakes the tasks waiting for a packet clearing the QUIC bit, if one arrived
+    fn forward_greased_packets(&mut self, shared: &Shared) {
+        let greased = self.inner.greased_packets_received();
+        if greased != self.greased_packets {
+            self.greased_packets = greased;
+            shared.greased_packet_received.notify_waiters();
         }
     }
 

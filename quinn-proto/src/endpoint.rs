@@ -28,8 +28,9 @@ use crate::{
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
-        ConnectionIdParser, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket,
-        Packet, PacketDecodeError, PacketNumber, PartialDecode, ProtectedInitialHeader,
+        ConnectionIdParser, FIXED_BIT, FixedLengthConnectionIdParser, Header, InitialHeader,
+        InitialPacket, Packet, PacketDecodeError, PacketNumber, PartialDecode,
+        ProtectedInitialHeader,
     },
     range_set::ArrayRangeSet,
     shared::{
@@ -1278,6 +1279,9 @@ pub struct FirstFlight {
     pub crypto: Vec<u8>,
     /// Whether a 0-RTT packet arrived
     pub zero_rtt: bool,
+    /// Whether an Initial packet cleared the QUIC bit (RFC 9287), as a client remembering
+    /// the server's grease_quic_bit may
+    pub greased: bool,
 }
 
 impl FirstFlight {
@@ -1302,6 +1306,7 @@ impl FirstFlight {
         }
         *largest = Some(largest.map_or(pn, |n| n.max(pn)));
         self.packets.push((pn, number.len() as u8));
+        self.greased |= packet.header_data[0] & FIXED_BIT == 0;
         let Ok(frames) = frame::Iter::new(packet.payload.freeze()) else {
             return;
         };

@@ -26,8 +26,8 @@ use crate::{
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
-        FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType, Packet,
-        PacketNumber, PartialDecode, SpaceId,
+        FIXED_BIT, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType,
+        Packet, PacketNumber, PartialDecode, SpaceId,
     },
     range_set::ArrayRangeSet,
     shared::{
@@ -248,6 +248,11 @@ pub struct Connection {
     sent_flight: Option<FirstFlight>,
     /// Whether the connection stopped answering the peer (see [`Self::fall_silent`])
     silent: bool,
+    /// Whether packets may clear the QUIC bit when the peer announced grease_quic_bit (see
+    /// [`Self::set_send_greased_quic_bit`])
+    send_greased_quic_bit: bool,
+    /// How many of the peer's packets cleared the QUIC bit (RFC 9287)
+    greased_packets_received: u64,
     /// QUIC version used for the connection.
     version: u32,
     /// The version the client chose, which its 0-RTT packets use whatever version compatible
@@ -333,6 +338,7 @@ impl Connection {
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
             path: PathData::new(remote, allow_mtud, None, 0, now, &config),
+            send_greased_quic_bit: config.send_greased_quic_bit,
             path_counter: 0,
             allow_mtud,
             local_ip,
@@ -424,6 +430,7 @@ impl Connection {
             stats: ConnectionStats::default(),
             sent_flight,
             silent: false,
+            greased_packets_received: 0,
             version,
             orig_version: version,
             pending_version,
@@ -1424,6 +1431,18 @@ impl Connection {
     /// connection silently ([`ConnectionError::TimedOut`]), as it ends the peer's
     pub fn fall_silent(&mut self) {
         self.silent = true;
+    }
+
+    /// Whether the packets sent from now on may clear the QUIC bit, as the peer's announced
+    /// grease_quic_bit allows: [`TransportConfig::send_greased_quic_bit`] at first
+    pub fn set_send_greased_quic_bit(&mut self, value: bool) {
+        self.send_greased_quic_bit = value;
+    }
+
+    /// How many of the peer's packets cleared the QUIC bit (RFC 9287), counting each
+    /// authenticated packet once
+    pub fn greased_packets_received(&self) -> u64 {
+        self.greased_packets_received
     }
 
     /// Drop the connection's state without telling the peer, as an endpoint that lost it: the
@@ -2626,6 +2645,9 @@ impl Connection {
                     trace!("dropping short packet during handshake");
                     return;
                 } else {
+                    if packet.header_data[0] & FIXED_BIT == 0 {
+                        self.greased_packets_received += 1;
+                    }
                     if let Header::Initial(InitialHeader { ref token, .. }) = packet.header {
                         if let State::Handshake(ref hs) = self.state {
                             if self.side.is_server() && token != &hs.expected_token {
