@@ -30,10 +30,10 @@ impl Incoming {
         state.endpoint.first_flight(&state.inner)
     }
 
-    /// Acknowledges the client's Initial packets received so far, without answering its
-    /// handshake (see [`proto::Endpoint::acknowledge`]): one whose handshake waits on
-    /// something else then measures its RTT from the acknowledgement. It can no longer be sent a
-    /// Retry.
+    /// Acknowledges the client's Initial packets received so far, and those received later as
+    /// they come, without answering its handshake (see [`proto::Endpoint::acknowledge`]): one
+    /// whose handshake waits on something else then measures its RTT from the acknowledgements.
+    /// It can no longer be sent a Retry.
     pub fn acknowledge(&self) {
         let state = self.0.as_ref().unwrap();
         state.endpoint.acknowledge(&state.inner);

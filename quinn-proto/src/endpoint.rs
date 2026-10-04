@@ -246,6 +246,7 @@ impl Endpoint {
             // Handle packet on existing connection
             match route_to {
                 RouteDatagramTo::Incoming(incoming_idx) => {
+                    let cid_len = self.local_cid_generator.cid_len();
                     let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
                     let config = &incoming_buffer.server_config;
 
@@ -258,9 +259,28 @@ impl Endpoint {
                             .checked_add(datagram_len as u64)
                             .is_some_and(|n| n <= config.incoming_buffer_size_total)
                     {
+                        // An acknowledged client's later ack-eliciting Initial packets are
+                        // acknowledged as they come
+                        let received =
+                            incoming_buffer
+                                .acknowledging
+                                .as_mut()
+                                .is_some_and(|acknowledging| {
+                                    acknowledging.receive(
+                                        &event,
+                                        cid_len,
+                                        &self.config.supported_versions,
+                                        self.config.grease_quic_bit,
+                                    )
+                                });
                         incoming_buffer.datagrams.push(event);
                         incoming_buffer.total_bytes += datagram_len as u64;
                         self.all_incoming_buffers_total_bytes += datagram_len as u64;
+                        if received {
+                            return self
+                                .send_acknowledgement(incoming_idx, buf)
+                                .map(DatagramEvent::Response);
+                        }
                     }
 
                     None
@@ -572,6 +592,7 @@ impl Endpoint {
             datagrams: Vec::new(),
             total_bytes: 0,
             acknowledged: None,
+            acknowledging: None,
         });
         self.index
             .insert_initial_incoming(header.dst_cid, incoming_idx);
@@ -594,70 +615,90 @@ impl Endpoint {
     }
 
     /// Acknowledges the client's Initial packets `incoming` received so far, ahead of the
-    /// server's handshake: an Initial packet carrying only an ACK frame, sent from the connection
-    /// ID the connection keeps once accepted, whose Initial packet numbers continue from it. The
-    /// client takes its first RTT sample from it rather than from a handshake answered late. A
-    /// client acknowledged can't be sent a Retry, and is refused from the same connection ID.
-    /// `None` when the endpoint's connection IDs are zero-length, which can't route the client's
-    /// next packets to `incoming`.
+    /// server's handshake, and those it receives later as they come: Initial packets carrying
+    /// only an ACK frame, sent from the connection ID the connection keeps once accepted, whose
+    /// Initial packet numbers continue from them. The client takes its RTT samples from them
+    /// rather than from a handshake answered late. A client acknowledged can't be sent a Retry,
+    /// and is refused from the same connection ID. `None` when the endpoint's connection IDs are
+    /// zero-length, which can't route the client's next packets to `incoming`.
     pub fn acknowledge(&mut self, incoming: &Incoming, buf: &mut Vec<u8>) -> Option<Transmit> {
         if self.local_cid_generator.cid_len() == 0 {
             return None;
         }
-        let mut ranges = ArrayRangeSet::new();
+        let mut received = ArrayRangeSet::new();
         for (number, _) in self.incoming_first_flight(incoming).packets {
-            ranges.insert_one(number);
+            received.insert_one(number);
         }
-        if ranges.is_empty() {
+        if received.is_empty() {
             return None;
         }
-        let buffer = &self.incoming_buffers[incoming.incoming_idx];
-        let (loc_cid, number) = match buffer.acknowledged {
-            Some(Acknowledged {
+        let header = &incoming.packet.header;
+        let server_config = &self.incoming_buffers[incoming.incoming_idx].server_config;
+        let keys = server_config
+            .crypto
+            .initial_keys(header.version, &header.dst_cid)
+            .ok()?;
+        let first_number = server_config.transport.initial_packet_number;
+        if self.incoming_buffers[incoming.incoming_idx]
+            .acknowledged
+            .is_none()
+        {
+            let loc_cid = loop {
+                let cid = self.local_cid_generator.generate_cid();
+                if !self.index.connection_ids.contains_key(&cid)
+                    && !self.index.connection_ids_initial.contains_key(&cid)
+                {
+                    break cid;
+                }
+            };
+            // The client sends its next Initial and 0-RTT packets to it
+            self.index
+                .insert_initial_incoming(loc_cid, incoming.incoming_idx);
+            self.incoming_buffers[incoming.incoming_idx].acknowledged = Some(Acknowledged {
                 loc_cid,
-                next_packet_number,
-            }) => (loc_cid, next_packet_number),
-            None => {
-                let number = buffer.server_config.transport.initial_packet_number;
-                let loc_cid = loop {
-                    let cid = self.local_cid_generator.generate_cid();
-                    if !self.index.connection_ids.contains_key(&cid)
-                        && !self.index.connection_ids_initial.contains_key(&cid)
-                    {
-                        break cid;
-                    }
-                };
-                // The client sends its next Initial and 0-RTT packets to it
-                self.index
-                    .insert_initial_incoming(loc_cid, incoming.incoming_idx);
-                (loc_cid, number)
-            }
-        };
-        self.incoming_buffers[incoming.incoming_idx].acknowledged = Some(Acknowledged {
-            loc_cid,
-            next_packet_number: number + 1,
+                next_packet_number: first_number,
+            });
+        }
+        self.incoming_buffers[incoming.incoming_idx].acknowledging = Some(Acknowledging {
+            keys,
+            rem_cid: header.src_cid,
+            version: header.version,
+            addresses: incoming.addresses,
+            received,
         });
+        self.send_acknowledgement(incoming.incoming_idx, buf)
+    }
+
+    /// An Initial packet acknowledging the Initial packets the client of the pending incoming
+    /// connection `incoming_idx` sent (see [`Self::acknowledge`]).
+    fn send_acknowledgement(&mut self, incoming_idx: usize, buf: &mut Vec<u8>) -> Option<Transmit> {
+        let buffer = &mut self.incoming_buffers[incoming_idx];
+        let acknowledged = buffer.acknowledged.as_mut()?;
+        let acknowledging = buffer.acknowledging.as_ref()?;
+        let number = acknowledged.next_packet_number;
+        acknowledged.next_packet_number += 1;
         let header = Header::Initial(InitialHeader {
-            dst_cid: incoming.packet.header.src_cid,
-            src_cid: loc_cid,
+            dst_cid: acknowledging.rem_cid,
+            src_cid: acknowledged.loc_cid,
             number: PacketNumber::new(number, 0),
             token: Bytes::new(),
-            version: incoming.packet.header.version,
+            version: acknowledging.version,
         });
+        let keys = &acknowledging.keys;
         let partial_encode = header.encode(buf);
-        frame::Ack::encode(0, &ranges, None, buf);
-        buf.resize(buf.len() + incoming.crypto.packet.local.tag_len(), 0);
+        frame::Ack::encode(0, &acknowledging.received, None, buf);
+        buf.resize(buf.len() + keys.packet.local.tag_len(), 0);
         partial_encode.finish(
             buf,
-            &*incoming.crypto.header.local,
-            Some((number, &*incoming.crypto.packet.local)),
+            &*keys.header.local,
+            Some((number, &*keys.packet.local)),
         );
         Some(Transmit {
-            destination: incoming.addresses.remote,
+            destination: acknowledging.addresses.remote,
             ecn: None,
             size: buf.len(),
             segment_size: None,
-            src_ip: incoming.addresses.local_ip,
+            src_ip: acknowledging.addresses.local_ip,
         })
     }
 
@@ -1287,27 +1328,19 @@ pub struct FirstFlight {
 impl FirstFlight {
     fn read(
         &mut self,
-        mut packet: Packet,
+        packet: Packet,
         keys: &Keys,
         largest: &mut Option<u64>,
         crypto: &mut Vec<(u64, Bytes)>,
     ) {
-        let Some(number) = packet.header.number() else {
+        let greased = packet.header_data[0] & FIXED_BIT == 0;
+        let Some((pn, len, payload)) = open_initial(packet, keys, *largest) else {
             return;
         };
-        let pn = number.expand(largest.map_or(0, |n| n + 1));
-        if keys
-            .packet
-            .remote
-            .decrypt(pn, &packet.header_data, &mut packet.payload)
-            .is_err()
-        {
-            return;
-        }
         *largest = Some(largest.map_or(pn, |n| n.max(pn)));
-        self.packets.push((pn, number.len() as u8));
-        self.greased |= packet.header_data[0] & FIXED_BIT == 0;
-        let Ok(frames) = frame::Iter::new(packet.payload.freeze()) else {
+        self.packets.push((pn, len));
+        self.greased |= greased;
+        let Ok(frames) = frame::Iter::new(payload.freeze()) else {
             return;
         };
         for frame in frames {
@@ -1320,6 +1353,22 @@ impl FirstFlight {
     }
 }
 
+/// An Initial packet's number, its encoded length and its payload, decrypted with `keys`
+/// (`largest` the largest number received before), unless it fails to decrypt
+fn open_initial(
+    mut packet: Packet,
+    keys: &Keys,
+    largest: Option<u64>,
+) -> Option<(u64, u8, BytesMut)> {
+    let number = packet.header.number()?;
+    let pn = number.expand(largest.map_or(0, |n| n + 1));
+    keys.packet
+        .remote
+        .decrypt(pn, &packet.header_data, &mut packet.payload)
+        .ok()?;
+    Some((pn, number.len() as u8, packet.payload))
+}
+
 /// Buffered Initial and 0-RTT messages for a pending incoming connection
 struct IncomingBuffer {
     server_config: Arc<ServerConfig>,
@@ -1327,6 +1376,60 @@ struct IncomingBuffer {
     total_bytes: u64,
     /// Set once the client's Initial packets were acknowledged (see [`Endpoint::acknowledge`])
     acknowledged: Option<Acknowledged>,
+    /// What acknowledges the client's later Initial packets as they come, once acknowledged
+    acknowledging: Option<Acknowledging>,
+}
+
+/// What acknowledges an acknowledged client's Initial packets (see [`Endpoint::acknowledge`])
+struct Acknowledging {
+    /// The Initial keys
+    keys: Keys,
+    /// The client's connection ID, version and addresses
+    rem_cid: ConnectionId,
+    version: u32,
+    addresses: FourTuple,
+    /// The numbers of its Initial packets received
+    received: ArrayRangeSet,
+}
+
+impl Acknowledging {
+    /// Records the Initial packets of `event`, a datagram the client sent: whether one is new
+    /// and ack-eliciting
+    fn receive(
+        &mut self,
+        event: &DatagramConnectionEvent,
+        cid_len: usize,
+        supported_versions: &[u32],
+        grease_quic_bit: bool,
+    ) -> bool {
+        let mut datagram = BytesMut::from(event.first_decode.data());
+        if let Some(rest) = &event.remaining {
+            datagram.extend_from_slice(rest);
+        }
+        let parser = FixedLengthConnectionIdParser::new(cid_len);
+        let mut new = false;
+        while !datagram.is_empty() {
+            let Ok((partial, rest)) =
+                PartialDecode::new(datagram, &parser, supported_versions, grease_quic_bit)
+            else {
+                break;
+            };
+            if partial.is_initial() {
+                let opened = partial
+                    .finish(Some(&*self.keys.header.remote))
+                    .ok()
+                    .and_then(|packet| open_initial(packet, &self.keys, self.received.max()));
+                if let Some((number, _, payload)) = opened {
+                    let eliciting = frame::Iter::new(payload.freeze()).is_ok_and(|mut frames| {
+                        frames.any(|frame| frame.is_ok_and(|frame| frame.is_ack_eliciting()))
+                    });
+                    new |= self.received.insert_one(number) && eliciting;
+                }
+            }
+            datagram = rest.unwrap_or_default();
+        }
+        new
+    }
 }
 
 /// How a pending incoming connection acknowledged the client's Initial packets
