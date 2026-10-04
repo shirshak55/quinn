@@ -46,6 +46,12 @@ impl SendStream {
         }
     }
 
+    /// Whether this client stream was opened in 0-RTT, before the handshake completed: the
+    /// server may reject the data sent on it (see [`WriteError::ZeroRttRejected`])
+    pub fn is_0rtt(&self) -> bool {
+        self.is_0rtt
+    }
+
     /// Write a buffer into this stream, returning how many bytes were written
     ///
     /// Unless this method errors, it waits until some amount of `buf` can be written into this
