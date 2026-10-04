@@ -103,6 +103,16 @@ impl PartialDecode {
         self.plain_header.dst_cid()
     }
 
+    /// The QUIC version of a long header packet other than Version Negotiation
+    pub(crate) fn version(&self) -> Option<u32> {
+        match self.plain_header {
+            ProtectedHeader::Initial(ProtectedInitialHeader { version, .. })
+            | ProtectedHeader::Long { version, .. }
+            | ProtectedHeader::Retry { version, .. } => Some(version),
+            ProtectedHeader::Short { .. } | ProtectedHeader::VersionNegotiate { .. } => None,
+        }
+    }
+
     /// Length of QUIC packet being decoded
     #[allow(unreachable_pub)] // fuzzing only
     pub fn len(&self) -> usize {
@@ -292,7 +302,7 @@ impl Header {
                 number,
                 version,
             }) => {
-                w.write(u8::from(LongHeaderType::Initial) | number.tag());
+                w.write(LongHeaderType::Initial.to_byte(version) | number.tag());
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -313,7 +323,7 @@ impl Header {
                 number,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Standard(ty)) | number.tag());
+                w.write(LongHeaderType::Standard(ty).to_byte(version) | number.tag());
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -330,7 +340,7 @@ impl Header {
                 ref src_cid,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Retry));
+                w.write(LongHeaderType::Retry.to_byte(version));
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -618,7 +628,7 @@ impl ProtectedHeader {
                 });
             }
 
-            match LongHeaderType::from_byte(first)? {
+            match LongHeaderType::from_byte(first, version) {
                 LongHeaderType::Initial => {
                     let token_len = buf.get_var()? as usize;
                     let token_start = buf.position() as usize;
@@ -826,28 +836,38 @@ pub(crate) enum LongHeaderType {
 }
 
 impl LongHeaderType {
-    fn from_byte(b: u8) -> Result<Self, PacketDecodeError> {
+    /// The type `b`, a long header's first byte, encodes in `version`: QUIC version 2 assigns
+    /// the type bits anew (RFC 9369 §3.2)
+    fn from_byte(b: u8, version: u32) -> Self {
         use {LongHeaderType::*, LongType::*};
         debug_assert!(b & LONG_HEADER_FORM != 0, "not a long packet");
-        Ok(match (b & 0x30) >> 4 {
+        let bits = (b & 0x30) >> 4;
+        let bits = match version {
+            crate::VERSION_2 => bits.wrapping_sub(1) & 0x3,
+            _ => bits,
+        };
+        match bits {
             0x0 => Initial,
             0x1 => Standard(ZeroRtt),
             0x2 => Standard(Handshake),
-            0x3 => Retry,
-            _ => unreachable!(),
-        })
-    }
-}
-
-impl From<LongHeaderType> for u8 {
-    fn from(ty: LongHeaderType) -> Self {
-        use {LongHeaderType::*, LongType::*};
-        match ty {
-            Initial => LONG_HEADER_FORM | FIXED_BIT,
-            Standard(ZeroRtt) => LONG_HEADER_FORM | FIXED_BIT | (0x1 << 4),
-            Standard(Handshake) => LONG_HEADER_FORM | FIXED_BIT | (0x2 << 4),
-            Retry => LONG_HEADER_FORM | FIXED_BIT | (0x3 << 4),
+            _ => Retry,
         }
+    }
+
+    /// The first byte of a long header of this type in `version`, packet number length aside
+    fn to_byte(self, version: u32) -> u8 {
+        use {LongHeaderType::*, LongType::*};
+        let bits: u8 = match self {
+            Initial => 0x0,
+            Standard(ZeroRtt) => 0x1,
+            Standard(Handshake) => 0x2,
+            Retry => 0x3,
+        };
+        let bits = match version {
+            crate::VERSION_2 => (bits + 1) & 0x3,
+            _ => bits,
+        };
+        LONG_HEADER_FORM | FIXED_BIT | (bits << 4)
     }
 }
 

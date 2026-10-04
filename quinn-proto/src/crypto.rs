@@ -79,6 +79,17 @@ pub trait Session: Send + Sync + 'static {
     /// Verify the integrity of a retry packet
     fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool;
 
+    /// Switch a client session to `version`, which the server negotiated in place of the one the
+    /// session started with (compatible version negotiation, RFC 9368), before any handshake keys
+    /// are derived: [`Self::initial_keys`], the handshake keys and the 1-RTT keys are then
+    /// `version`'s, while the 0-RTT keys stay the original version's (RFC 9369 §4.1)
+    ///
+    /// Sessions that can't switch return `Err`, as by default.
+    fn switch_version(&mut self, version: u32) -> Result<(), UnsupportedVersion> {
+        let _ = version;
+        Err(UnsupportedVersion)
+    }
+
     /// Fill `output` with `output.len()` bytes of keying material derived
     /// from the [Session]'s secrets, using `label` and `context` for domain
     /// separation.

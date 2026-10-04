@@ -22,6 +22,7 @@ use crate::{
     Side, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
+    compatible_versions,
     config::{ClientConfig, EndpointConfig, ServerConfig},
     connection::{Connection, ConnectionError, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
@@ -36,7 +37,7 @@ use crate::{
         EndpointEvent, EndpointEventInner, IssuedCid,
     },
     token::{IncomingToken, InvalidRetryTokenError, Token, TokenPayload},
-    transport_parameters::{PreferredAddress, TransportParameters},
+    transport_parameters::{PreferredAddress, TransportParameters, VersionInformation},
 };
 
 /// The main entry point to the library
@@ -387,6 +388,7 @@ impl Endpoint {
             self.conn_cid_generators.insert(ch, generator);
         }
         let loc_cid = self.new_cid(ch);
+        let version_information = config.version_information();
         let params = TransportParameters::new(
             &config.transport,
             &self.config,
@@ -396,6 +398,7 @@ impl Endpoint {
                 .as_ref(),
             loc_cid,
             None,
+            version_information.clone(),
             &mut self.rng,
         );
         let tls = config
@@ -421,6 +424,7 @@ impl Endpoint {
             SideArgs::Client {
                 token_store: config.token_store,
                 server_name: server_name.into(),
+                available_versions: version_information.available,
             },
         );
         Ok((ch, conn))
@@ -739,6 +743,15 @@ impl Endpoint {
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<(ConnectionHandle, Connection), AcceptError> {
         let remote_address_validated = incoming.remote_address_validated();
+        let server_config = server_config.unwrap_or_else(|| {
+            self.incoming_buffers[incoming.incoming_idx]
+                .server_config
+                .clone()
+        });
+        // Read before accepting consumes the client's Initial packets
+        let offered_versions = server_config
+            .preferred_version
+            .and_then(|_| client_versions(&self.incoming_first_flight(&incoming).crypto));
         incoming.improper_drop_warner.dismiss();
         let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
@@ -754,7 +767,6 @@ impl Endpoint {
             version,
             ..
         } = incoming.packet.header;
-        let server_config = server_config.unwrap_or_else(|| incoming_buffer.server_config.clone());
 
         if server_config
             .transport
@@ -807,6 +819,19 @@ impl Endpoint {
             });
         };
 
+        // The server's preferred version, when the client offers it and the session can run it in
+        // place of the client's compatible one (RFC 9368 §2.3)
+        let negotiated_version = server_config.preferred_version.filter(|&preferred| {
+            compatible_versions(version, preferred)
+                && offered_versions
+                    .as_ref()
+                    .is_some_and(|offered| offered.contains(&preferred))
+                && self.config.supported_versions.contains(&preferred)
+                && server_config
+                    .crypto
+                    .initial_keys(preferred, &dst_cid)
+                    .is_ok()
+        });
         let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = match acknowledged {
             Some(acknowledged) => {
@@ -821,6 +846,10 @@ impl Endpoint {
             self.local_cid_generator.as_ref(),
             loc_cid,
             Some(&server_config),
+            VersionInformation {
+                chosen: negotiated_version.unwrap_or(version),
+                available: self.config.supported_versions.clone(),
+            },
             &mut self.rng,
         );
         params.stateless_reset_token = Some(ResetToken::new(&*self.config.reset_key, loc_cid));
@@ -838,7 +867,10 @@ impl Endpoint {
             });
         }
 
-        let tls = server_config.crypto.clone().start_session(version, &params);
+        let tls = server_config
+            .crypto
+            .clone()
+            .start_session(negotiated_version.unwrap_or(version), &params);
         let transport_config = server_config.transport.clone();
         let mut conn = self.add_connection(
             ch,
@@ -854,6 +886,7 @@ impl Endpoint {
                 server_config,
                 pref_addr_cid,
                 path_validated: remote_address_validated,
+                negotiated_version,
             },
         );
         self.index.insert_initial(dst_cid, ch);
@@ -937,6 +970,35 @@ impl Endpoint {
             TransportError::CONNECTION_REFUSED(""),
             buf,
         )
+    }
+
+    /// Answer this incoming connection attempt with a Version Negotiation packet listing
+    /// `versions` (RFC 9000 §17.2.1), as a server that doesn't support its version would
+    pub fn version_negotiate(
+        &mut self,
+        incoming: Incoming,
+        versions: &[u32],
+        buf: &mut Vec<u8>,
+    ) -> Transmit {
+        self.clean_up_incoming(&incoming);
+        incoming.improper_drop_warner.dismiss();
+
+        Header::VersionNegotiate {
+            random: self.rng.random::<u8>() | 0x40,
+            src_cid: incoming.packet.header.dst_cid,
+            dst_cid: incoming.packet.header.src_cid,
+        }
+        .encode(buf);
+        for &version in versions {
+            buf.write(version);
+        }
+        Transmit {
+            destination: incoming.addresses.remote,
+            ecn: None,
+            size: buf.len(),
+            segment_size: None,
+            src_ip: incoming.addresses.local_ip,
+        }
     }
 
     /// Respond with a retry packet, requiring the client to retry with address validation
@@ -1269,6 +1331,41 @@ struct Acknowledged {
     loc_cid: ConnectionId,
     /// The Initial packet number its next packet takes
     next_packet_number: u64,
+}
+
+/// The versions the version_information transport parameter in `client_hello`, a TLS
+/// ClientHello message, offers
+fn client_versions(client_hello: &[u8]) -> Option<Vec<u32>> {
+    fn take<'a>(r: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        let (head, tail) = r.split_at_checked(n)?;
+        *r = tail;
+        Some(head)
+    }
+    fn vector<'a>(r: &mut &'a [u8], len_bytes: usize) -> Option<&'a [u8]> {
+        let len = take(r, len_bytes)?
+            .iter()
+            .fold(0, |len, &b| len << 8 | usize::from(b));
+        take(r, len)
+    }
+    let mut r = client_hello;
+    if take(&mut r, 1)? != [1] {
+        return None;
+    }
+    let mut body = vector(&mut r, 3)?;
+    take(&mut body, 2 + 32)?;
+    vector(&mut body, 1)?;
+    vector(&mut body, 2)?;
+    vector(&mut body, 1)?;
+    let mut extensions = vector(&mut body, 2)?;
+    while !extensions.is_empty() {
+        let ty = take(&mut extensions, 2)?;
+        let mut data = vector(&mut extensions, 2)?;
+        if ty == [0x00, 0x39] {
+            let params = TransportParameters::read(Side::Server, &mut data).ok()?;
+            return params.version_information.map(|info| info.available);
+        }
+    }
+    None
 }
 
 /// Part of protocol state incoming datagrams can be routed to

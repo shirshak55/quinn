@@ -21,6 +21,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
+    compatible_versions,
     config::{ServerConfig, TransportConfig},
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
@@ -249,6 +250,17 @@ pub struct Connection {
     silent: bool,
     /// QUIC version used for the connection.
     version: u32,
+    /// The version the client chose, which its 0-RTT packets use whatever version compatible
+    /// version negotiation switched the connection to (RFC 9369 §4.1)
+    orig_version: u32,
+    /// The version a server switches the connection to once it processed the client's transport
+    /// parameters (RFC 9369 §4.1)
+    pending_version: Option<u32>,
+    /// The original version's Initial keys once the connection switched versions, for its
+    /// Initial packets still in flight
+    orig_initial_crypto: Option<Keys>,
+    /// The versions a server's Version Negotiation packet listed, when one ended the connection
+    server_versions: Option<Vec<u32>>,
 }
 
 impl Connection {
@@ -270,6 +282,22 @@ impl Connection {
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
+        // A server switching versions answers in the client's until it has its transport
+        // parameters, while its session runs the version it switches to.
+        let (initial_keys, pending_version) = match &side_args {
+            SideArgs::Server {
+                server_config,
+                negotiated_version: Some(negotiated),
+                ..
+            } => (
+                server_config
+                    .crypto
+                    .initial_keys(version, &init_cid)
+                    .expect("the endpoint read the client's Initial with these keys"),
+                Some(*negotiated),
+            ),
+            _ => (crypto.initial_keys(&init_cid, side_args.side()), None),
+        };
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
         let sent_flight = match &connection_side {
@@ -283,7 +311,7 @@ impl Connection {
             ConnectionSide::Server { .. } => None,
         };
         let initial_space = PacketSpace {
-            crypto: Some(crypto.initial_keys(&init_cid, side)),
+            crypto: Some(initial_keys),
             next_packet_number: config.initial_packet_number,
             ..PacketSpace::new(now)
         };
@@ -397,6 +425,10 @@ impl Connection {
             sent_flight,
             silent: false,
             version,
+            orig_version: version,
+            pending_version,
+            orig_initial_crypto: None,
+            server_versions: None,
         };
         if path_validated {
             this.on_path_validated();
@@ -1597,6 +1629,18 @@ impl Connection {
         self.sent_flight.as_ref()
     }
 
+    /// The QUIC version the connection uses: the one compatible version negotiation (RFC 9368)
+    /// switched it to from the client's, if it did
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// The versions the server's Version Negotiation packet listed, once one ended this client
+    /// connection ([`ConnectionError::VersionMismatch`])
+    pub fn server_versions(&self) -> Option<&[u32]> {
+        self.server_versions.as_deref()
+    }
+
     /// Current number of remotely initiated streams that may be concurrently open
     ///
     /// If the target for this limit is reduced using [`set_max_concurrent_streams`](Self::set_max_concurrent_streams),
@@ -2385,6 +2429,7 @@ impl Connection {
             if let ConnectionSide::Client { token, .. } = &mut self.side {
                 *token = Bytes::new();
             }
+            self.orig_initial_crypto = None;
         }
         let space = &mut self.spaces[space_id];
         space.crypto = None;
@@ -2410,7 +2455,7 @@ impl Connection {
             match PartialDecode::new(
                 data,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
-                &[self.version],
+                &self.endpoint_config.supported_versions,
                 self.endpoint_config.grease_quic_bit,
             ) {
                 Ok((partial_decode, rest)) => {
@@ -2432,14 +2477,79 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
     ) {
+        if let Some(version) = partial_decode.version() {
+            if !self.accepts_version(version, &partial_decode) {
+                debug!(version, "dropping packet of another version");
+                return;
+            }
+        }
         if let Some(decoded) = packet_crypto::unprotect_header(
             partial_decode,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.orig_initial(),
             self.peer_params.stateless_reset_token,
         ) {
             self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
         }
+    }
+
+    /// Whether to process a long header packet of `version`: the connection's, the original's
+    /// for 0-RTT packets and Initial packets in flight when it switched, or one a client learns
+    /// the server negotiated from its first Initial packet using it (RFC 9369 §4.1)
+    fn accepts_version(&mut self, version: u32, packet: &PartialDecode) -> bool {
+        if packet.is_0rtt() {
+            return version == self.orig_version;
+        }
+        if version == self.version {
+            return true;
+        }
+        if version == self.orig_version {
+            return packet.is_initial() && self.orig_initial_crypto.is_some();
+        }
+        packet.is_initial() && self.switch_version(version)
+    }
+
+    /// Switches a client connection to `version`, which the server negotiated from the one it
+    /// chose and offered, before the server's handshake data arrived (RFC 9368 §2.3)
+    fn switch_version(&mut self, version: u32) -> bool {
+        let ConnectionSide::Client {
+            available_versions, ..
+        } = &self.side
+        else {
+            return false;
+        };
+        if self.version != self.orig_version
+            || self.highest_space != SpaceId::Initial
+            || !compatible_versions(self.version, version)
+            || !available_versions.contains(&version)
+            || self.crypto.switch_version(version).is_err()
+        {
+            return false;
+        }
+        debug!(
+            from = self.version,
+            to = version,
+            "server negotiated a compatible version"
+        );
+        self.use_version(version);
+        true
+    }
+
+    /// Sends and receives `version`'s packets from now on, keeping the current version's
+    /// Initial keys for its packets in flight
+    fn use_version(&mut self, version: u32) {
+        let cid = self.retry_src_cid.unwrap_or(self.initial_dst_cid);
+        let keys = self.crypto.initial_keys(&cid, self.side.side());
+        self.orig_initial_crypto = self.spaces[SpaceId::Initial].crypto.replace(keys);
+        self.version = version;
+    }
+
+    /// The original version and its Initial keys, once the connection switched versions
+    fn orig_initial(&self) -> Option<(u32, &Keys)> {
+        self.orig_initial_crypto
+            .as_ref()
+            .map(|keys| (self.orig_version, keys))
     }
 
     fn handle_packet(
@@ -2822,6 +2932,9 @@ impl Connection {
                                 reason: "transport parameters missing".into(),
                             })?;
                     self.handle_peer_params(params)?;
+                    if let Some(version) = self.pending_version.take() {
+                        self.use_version(version);
+                    }
                     self.issue_first_cids(now);
                     self.init_0rtt();
                 }
@@ -2838,17 +2951,16 @@ impl Connection {
                 if self.total_authed_packets > 1 {
                     return Ok(());
                 }
-                let supported = packet
+                let versions = packet
                     .payload
-                    .chunks(4)
-                    .any(|x| match <[u8; 4]>::try_from(x) {
-                        Ok(version) => self.version == u32::from_be_bytes(version),
-                        Err(_) => false,
-                    });
-                if supported {
+                    .chunks_exact(4)
+                    .map(|x| u32::from_be_bytes(x.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                if versions.contains(&self.orig_version) {
                     return Ok(());
                 }
                 debug!("remote doesn't support our version");
+                self.server_versions = Some(versions);
                 Err(ConnectionError::VersionMismatch)
             }
             Header::Short { .. } => unreachable!(
@@ -3695,10 +3807,37 @@ impl Connection {
                 "CID authentication failure",
             ));
         }
+        self.validate_version_information(&params)?;
 
         self.set_peer_params(params);
 
         Ok(())
+    }
+
+    /// Checks the peer's version_information against the versions the connection used (RFC 9368
+    /// §4): a client's chose the original version and offers any the server switches to, and a
+    /// server's chose the version in use (one the client offered, as it switched to it)
+    fn validate_version_information(
+        &self,
+        params: &TransportParameters,
+    ) -> Result<(), TransportError> {
+        let info = params.version_information.as_ref();
+        let valid = match &self.side {
+            ConnectionSide::Server { .. } => match self.pending_version {
+                Some(negotiated) => info.is_some_and(|info| {
+                    info.chosen == self.orig_version && info.available.contains(&negotiated)
+                }),
+                None => info.is_none_or(|info| info.chosen == self.orig_version),
+            },
+            ConnectionSide::Client { .. } => match info {
+                Some(info) => info.chosen == self.version,
+                None => self.version == self.orig_version,
+            },
+        };
+        match valid {
+            true => Ok(()),
+            false => Err(TransportError::VERSION_NEGOTIATION_ERROR("")),
+        }
     }
 
     fn set_peer_params(&mut self, params: TransportParameters) {
@@ -3730,6 +3869,7 @@ impl Connection {
             packet,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.orig_initial(),
             self.key_phase,
             self.prev_crypto.as_ref(),
             self.next_crypto.as_ref(),
@@ -3818,6 +3958,7 @@ impl Connection {
             first_decode.clone(),
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.orig_initial(),
             self.peer_params.stateless_reset_token,
         )?;
 
@@ -3826,6 +3967,7 @@ impl Connection {
             &mut packet,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
+            self.orig_initial(),
             self.key_phase,
             self.prev_crypto.as_ref(),
             self.next_crypto.as_ref(),
@@ -4004,6 +4146,8 @@ enum ConnectionSide {
         token: Bytes,
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        /// The versions its version_information offers, the server may switch it to
+        available_versions: Vec<u32>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -4040,16 +4184,14 @@ impl From<SideArgs> for ConnectionSide {
             SideArgs::Client {
                 token_store,
                 server_name,
+                available_versions,
             } => Self::Client {
                 token: token_store.take(&server_name).unwrap_or_default(),
                 token_store,
                 server_name,
+                available_versions,
             },
-            SideArgs::Server {
-                server_config,
-                pref_addr_cid: _,
-                path_validated: _,
-            } => Self::Server { server_config },
+            SideArgs::Server { server_config, .. } => Self::Server { server_config },
         }
     }
 }
@@ -4059,11 +4201,15 @@ pub(crate) enum SideArgs {
     Client {
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        /// The versions its version_information offers
+        available_versions: Vec<u32>,
     },
     Server {
         server_config: Arc<ServerConfig>,
         pref_addr_cid: Option<ConnectionId>,
         path_validated: bool,
+        /// The version it switches to from the client's (see [`ServerConfig::preferred_version`])
+        negotiated_version: Option<u32>,
     },
 }
 

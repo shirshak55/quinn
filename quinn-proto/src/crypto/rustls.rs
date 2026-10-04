@@ -185,11 +185,7 @@ impl crypto::Session for TlsSession {
         let tag_start = tag_start + pseudo_packet.len();
         pseudo_packet.extend_from_slice(payload);
 
-        let (nonce, key) = match self.version {
-            Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
-            _ => unreachable!(),
-        };
+        let (nonce, key) = retry_integrity(self.version);
 
         let nonce = aead::Nonce::assume_unique_for_key(nonce);
         let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
@@ -224,6 +220,24 @@ const RETRY_INTEGRITY_KEY_V1: [u8; 16] = [
 const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
+
+// https://www.rfc-editor.org/rfc/rfc9369.html#section-3.3.3
+const RETRY_INTEGRITY_KEY_V2: [u8; 16] = [
+    0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92,
+];
+const RETRY_INTEGRITY_NONCE_V2: [u8; 12] = [
+    0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a,
+];
+
+/// The Retry Integrity Tag's nonce and key in `version`
+fn retry_integrity(version: Version) -> ([u8; 12], [u8; 16]) {
+    match version {
+        Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
+        Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
+        Version::V2 => (RETRY_INTEGRITY_NONCE_V2, RETRY_INTEGRITY_KEY_V2),
+        _ => unreachable!(),
+    }
+}
 
 impl crypto::HeaderKey for Box<dyn HeaderProtectionKey> {
     fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
@@ -360,6 +374,14 @@ impl crypto::ClientConfig for QuicClientConfig {
         server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn crypto::Session>, ConnectError> {
+        // A rustls session runs a single version, so it can't offer to switch to another
+        if params.version_information.as_ref().is_some_and(|info| {
+            info.available
+                .iter()
+                .any(|&offered| crate::compatible_versions(version, offered))
+        }) {
+            return Err(ConnectError::UnsupportedVersion);
+        }
         let version = interpret_version(version)?;
         Ok(Box::new(TlsSession {
             version,
@@ -555,11 +577,7 @@ impl crypto::ServerConfig for QuicServerConfig {
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
         // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
         let version = interpret_version(version).unwrap();
-        let (nonce, key) = match version {
-            Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
-            _ => unreachable!(),
-        };
+        let (nonce, key) = retry_integrity(version);
 
         let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
         pseudo_packet.push(orig_dst_cid.len() as u8);
@@ -665,6 +683,7 @@ fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {
     match version {
         0xff00_001d..=0xff00_0020 => Ok(Version::V1Draft),
         0x0000_0001 | 0xff00_0021..=0xff00_0022 => Ok(Version::V1),
+        crate::VERSION_2 => Ok(Version::V2),
         _ => Err(UnsupportedVersion),
     }
 }

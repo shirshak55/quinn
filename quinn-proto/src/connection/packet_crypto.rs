@@ -2,8 +2,8 @@ use tracing::{debug, trace};
 
 use crate::Instant;
 use crate::connection::spaces::PacketSpace;
-use crate::crypto::{HeaderKey, KeyPair, PacketKey};
-use crate::packet::{Packet, PartialDecode, SpaceId};
+use crate::crypto::{HeaderKey, KeyPair, Keys, PacketKey};
+use crate::packet::{Header, InitialHeader, Packet, PartialDecode, SpaceId};
 use crate::token::ResetToken;
 use crate::{RESET_TOKEN_SIZE, TransportError};
 
@@ -12,6 +12,7 @@ pub(super) fn unprotect_header(
     partial_decode: PartialDecode,
     spaces: &[PacketSpace; 3],
     zero_rtt_crypto: Option<&ZeroRttCrypto>,
+    orig_initial: Option<(u32, &Keys)>,
     stateless_reset_token: Option<ResetToken>,
 ) -> Option<UnprotectHeaderResult> {
     let header_crypto = if partial_decode.is_0rtt() {
@@ -21,6 +22,10 @@ pub(super) fn unprotect_header(
             debug!("dropping unexpected 0-RTT packet");
             return None;
         }
+    } else if let Some((_, keys)) = orig_initial.filter(|(version, _)| {
+        partial_decode.is_initial() && partial_decode.version() == Some(*version)
+    }) {
+        Some(&*keys.header.remote)
     } else if let Some(space) = partial_decode.space() {
         if let Some(ref crypto) = spaces[space].crypto {
             Some(&*crypto.header.remote)
@@ -70,6 +75,7 @@ pub(super) fn decrypt_packet_body(
     packet: &mut Packet,
     spaces: &[PacketSpace; 3],
     zero_rtt_crypto: Option<&ZeroRttCrypto>,
+    orig_initial: Option<(u32, &Keys)>,
     conn_key_phase: bool,
     prev_crypto: Option<&PrevCrypto>,
     next_crypto: Option<&KeyPair<Box<dyn PacketKey>>>,
@@ -86,6 +92,10 @@ pub(super) fn decrypt_packet_body(
     let mut crypto_update = false;
     let crypto = if packet.header.is_0rtt() {
         &zero_rtt_crypto.unwrap().packet
+    } else if let Some((_, keys)) = orig_initial.filter(|(orig, _)| {
+        matches!(packet.header, Header::Initial(InitialHeader { version, .. }) if version == *orig)
+    }) {
+        &keys.packet.remote
     } else if packet_key_phase == conn_key_phase || space != SpaceId::Data {
         &spaces[space].crypto.as_ref().unwrap().packet.remote
     } else if let Some(prev) = prev_crypto.filter(|&crypto|

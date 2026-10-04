@@ -62,6 +62,13 @@ impl Incoming {
         state.endpoint.refuse(state.inner);
     }
 
+    /// Answer this incoming connection attempt with a Version Negotiation packet listing
+    /// `versions`, as a server that doesn't support its version would
+    pub fn version_negotiate(mut self, versions: &[u32]) {
+        let state = self.0.take().unwrap();
+        state.endpoint.version_negotiate(state.inner, versions);
+    }
+
     /// Respond with a retry packet, requiring the client to retry with address validation
     ///
     /// Errors if `may_retry()` is false.

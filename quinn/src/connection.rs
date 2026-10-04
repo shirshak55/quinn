@@ -38,6 +38,7 @@ pub struct Connecting {
     conn: Option<ConnectionRef>,
     connected: oneshot::Receiver<bool>,
     handshake_data_ready: Option<oneshot::Receiver<()>>,
+    server_versions: Option<Vec<u32>>,
 }
 
 impl Connecting {
@@ -76,6 +77,7 @@ impl Connecting {
             conn: Some(conn),
             connected: on_connected_recv,
             handshake_data_ready: Some(on_handshake_data_recv),
+            server_versions: None,
         }
     }
 
@@ -191,6 +193,14 @@ impl Connecting {
         let conn_ref: &ConnectionRef = self.conn.as_ref().expect("used after yielding Ready");
         conn_ref.state.lock("remote_address").inner.remote_address()
     }
+
+    /// The versions the server's Version Negotiation packet listed, once `poll` returned
+    /// [`ConnectionError::VersionMismatch`] for it
+    ///
+    /// See [`proto::Connection::server_versions()`].
+    pub fn server_versions(&self) -> Option<&[u32]> {
+        self.server_versions.as_deref()
+    }
 }
 
 impl Future for Connecting {
@@ -203,6 +213,7 @@ impl Future for Connecting {
                 drop(inner);
                 Ok(Connection(conn))
             } else {
+                self.server_versions = inner.inner.server_versions().map(<[u32]>::to_vec);
                 Err(inner
                     .error
                     .clone()
@@ -814,6 +825,13 @@ impl Connection {
             .inner
             .sent_first_flight()
             .cloned()
+    }
+
+    /// The QUIC version the connection uses
+    ///
+    /// See [`proto::Connection::version()`].
+    pub fn version(&self) -> u32 {
+        self.0.state.lock("version").inner.version()
     }
 }
 

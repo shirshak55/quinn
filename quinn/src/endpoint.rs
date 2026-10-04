@@ -454,6 +454,16 @@ impl EndpointInner {
         respond(transmit, &response_buffer, &*state.socket);
     }
 
+    pub(crate) fn version_negotiate(&self, incoming: proto::Incoming, versions: &[u32]) {
+        let mut state = self.state.lock().unwrap();
+        state.stats.refused_handshakes += 1;
+        let mut response_buffer = Vec::new();
+        let transmit = state
+            .inner
+            .version_negotiate(incoming, versions, &mut response_buffer);
+        respond(transmit, &response_buffer, &*state.socket);
+    }
+
     pub(crate) fn retry(&self, incoming: proto::Incoming) -> Result<(), proto::RetryError> {
         let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();

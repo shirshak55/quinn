@@ -66,7 +66,7 @@ macro_rules! apply_params {
 macro_rules! make_struct {
     {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
         /// Transport parameters used to negotiate connection-level preferences between peers
-        #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+        #[derive(Debug, Clone, Eq, PartialEq)]
         pub struct TransportParameters {
             $($(#[$doc])* pub(crate) $name : VarInt,)*
 
@@ -92,6 +92,10 @@ macro_rules! make_struct {
             ///
             /// Only read: quinn doesn't send this parameter.
             pub(crate) reset_stream_at: bool,
+
+            /// The version the endpoint chose for the connection, and those it offers or deploys
+            /// (RFC 9368)
+            pub(crate) version_information: Option<VersionInformation>,
 
             // Server-only
             /// The value of the Destination Connection ID field from the first Initial packet sent
@@ -131,6 +135,7 @@ macro_rules! make_struct {
                     grease_quic_bit: false,
                     min_ack_delay: None,
                     reset_stream_at: false,
+                    version_information: None,
 
                     original_dst_cid: None,
                     retry_src_cid: None,
@@ -153,6 +158,7 @@ impl TransportParameters {
         cid_gen: &dyn ConnectionIdGenerator,
         initial_src_cid: ConnectionId,
         server_config: Option<&ServerConfig>,
+        version_information: VersionInformation,
         rng: &mut impl Rng,
     ) -> Self {
         Self {
@@ -187,6 +193,7 @@ impl TransportParameters {
             min_ack_delay: Some(
                 VarInt::from_u64(u64::try_from(config.min_ack_delay.as_micros()).unwrap()).unwrap(),
             ),
+            version_information: Some(version_information),
             grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
             write_order: Some({
                 let mut order = std::array::from_fn(|i| i as u8);
@@ -288,6 +295,43 @@ impl PreferredAddress {
             connection_id: cid,
             stateless_reset_token: token.into(),
         })
+    }
+}
+
+/// Version Information (RFC 9368 §3): the version its sender chose for the connection, and the
+/// versions it offers, in order of preference (a client), or deploys (a server)
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct VersionInformation {
+    pub(crate) chosen: u32,
+    pub(crate) available: Vec<u32>,
+}
+
+impl VersionInformation {
+    fn write<W: BufMut>(&self, w: &mut W) {
+        w.write_var(TransportParameterId::VersionInformation as u64);
+        w.write_var(4 * (1 + self.available.len() as u64));
+        w.write(self.chosen);
+        for &version in &self.available {
+            w.write(version);
+        }
+    }
+
+    /// Reads one `len` bytes long, a client's when `side` is the server (RFC 9368 §4)
+    fn read<R: Buf>(r: &mut R, len: usize, side: Side) -> Result<Self, Error> {
+        if len < 4 || len % 4 != 0 {
+            return Err(Error::Malformed);
+        }
+        let chosen = r.get::<u32>()?;
+        let available = (1..len / 4)
+            .map(|_| r.get::<u32>())
+            .collect::<Result<Vec<_>, _>>()?;
+        if chosen == 0
+            || available.contains(&0)
+            || (side.is_server() && !available.contains(&chosen))
+        {
+            return Err(Error::IllegalValue);
+        }
+        Ok(Self { chosen, available })
     }
 }
 
@@ -393,6 +437,11 @@ impl TransportParameters {
                         w.write(x);
                     }
                 }
+                TransportParameterId::VersionInformation => {
+                    if let Some(info) = &self.version_information {
+                        info.write(w);
+                    }
+                }
                 id => {
                     macro_rules! write_params {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
@@ -494,6 +543,12 @@ impl TransportParameters {
                     _ => return Err(Error::Malformed),
                 },
                 TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
+                TransportParameterId::VersionInformation => {
+                    if params.version_information.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.version_information = Some(VersionInformation::read(r, len, side)?);
+                }
                 _ => {
                     macro_rules! parse {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
@@ -649,6 +704,9 @@ pub(crate) enum TransportParameterId {
     InitialSourceConnectionId = 0x0F,
     RetrySourceConnectionId = 0x10,
 
+    // https://www.rfc-editor.org/rfc/rfc9368.html#section-3
+    VersionInformation = 0x11,
+
     // Smallest possible ID of reserved transport parameter https://datatracker.ietf.org/doc/html/rfc9000#section-22.3
     ReservedTransportParameter = 0x1B,
 
@@ -664,7 +722,7 @@ pub(crate) enum TransportParameterId {
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 21] = [
+    const SUPPORTED: [Self; 22] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -684,6 +742,7 @@ impl TransportParameterId {
         Self::OriginalDestinationConnectionId,
         Self::InitialSourceConnectionId,
         Self::RetrySourceConnectionId,
+        Self::VersionInformation,
         Self::GreaseQuicBit,
         Self::MinAckDelayDraft07,
     ];
@@ -723,6 +782,7 @@ impl TryFrom<u64> for TransportParameterId {
             }
             id if Self::InitialSourceConnectionId == id => Self::InitialSourceConnectionId,
             id if Self::RetrySourceConnectionId == id => Self::RetrySourceConnectionId,
+            id if Self::VersionInformation == id => Self::VersionInformation,
             id if Self::GreaseQuicBit == id => Self::GreaseQuicBit,
             id if Self::MinAckDelayDraft07 == id => Self::MinAckDelayDraft07,
             _ => return Err(()),

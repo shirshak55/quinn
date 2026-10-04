@@ -160,6 +160,7 @@ pub mod fuzzing {
 /// The QUIC protocol version implemented.
 pub const DEFAULT_SUPPORTED_VERSIONS: &[u32] = &[
     0x00000001,
+    VERSION_2,
     0xff00_001d,
     0xff00_001e,
     0xff00_001f,
@@ -167,6 +168,15 @@ pub const DEFAULT_SUPPORTED_VERSIONS: &[u32] = &[
     0xff00_0021,
     0xff00_0022,
 ];
+
+/// QUIC version 2 (RFC 9369)
+pub(crate) const VERSION_2: u32 = 0x6b33_43cf;
+
+/// Whether compatible version negotiation (RFC 9368) can switch a connection from version `from`
+/// to `to`: between QUIC versions 1 and 2, either way (RFC 9369 §4)
+pub(crate) fn compatible_versions(from: u32, to: u32) -> bool {
+    matches!((from, to), (1, VERSION_2) | (VERSION_2, 1))
+}
 
 /// Whether an endpoint was the initiator of a connection
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]

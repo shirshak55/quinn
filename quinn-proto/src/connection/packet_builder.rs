@@ -107,7 +107,7 @@ impl PacketBuilder {
                 src_cid: conn.handshake_cid,
                 dst_cid,
                 number,
-                version,
+                version: conn.orig_version,
             },
             SpaceId::Handshake => Header::Long {
                 ty: LongType::Handshake,
