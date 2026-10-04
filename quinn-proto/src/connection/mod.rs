@@ -1334,6 +1334,14 @@ impl Connection {
         )
     }
 
+    /// Close a connection immediately with a transport error, as [`Self::close`] does with an
+    /// application one: `close`'s error code, frame type and reason go in a CONNECTION_CLOSE
+    /// frame of type 0x1c, as relaying one a peer sent ([`ConnectionError::ConnectionClosed`])
+    /// needs
+    pub fn close_transport(&mut self, now: Instant, close: frame::ConnectionClose) {
+        self.close_inner(now, Close::Connection(close))
+    }
+
     fn close_inner(&mut self, now: Instant, reason: Close) {
         let was_closed = self.state.is_closed();
         if !was_closed {

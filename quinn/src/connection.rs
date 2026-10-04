@@ -28,8 +28,8 @@ use crate::{
     udp_transmit,
 };
 use proto::{
-    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent,
-    StreamId, congestion::Controller,
+    ConnectionClose, ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side,
+    StreamEvent, StreamId, congestion::Controller,
 };
 
 /// In-progress connection attempt future
@@ -436,6 +436,15 @@ impl Connection {
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
         let conn = &mut *self.0.state.lock("close");
         conn.close(error_code, Bytes::copy_from_slice(reason), &self.0.shared);
+    }
+
+    /// Close the connection immediately with a transport error, as [`close()`](Self::close)
+    /// does with an application one: `close`'s error code, frame type and reason go in a
+    /// CONNECTION_CLOSE frame of type 0x1c, as relaying one the peer of another connection sent
+    /// ([`ConnectionError::ConnectionClosed`]) needs
+    pub fn close_transport(&self, close: ConnectionClose) {
+        let conn = &mut *self.0.state.lock("close_transport");
+        conn.close_transport(close, &self.0.shared);
     }
 
     /// Transmit `data` as an unreliable, unordered application datagram
@@ -1302,6 +1311,12 @@ impl State {
 
     fn close(&mut self, error_code: VarInt, reason: Bytes, shared: &Shared) {
         self.inner.close(self.runtime.now(), error_code, reason);
+        self.terminate(ConnectionError::LocallyClosed, shared);
+        self.wake();
+    }
+
+    fn close_transport(&mut self, close: ConnectionClose, shared: &Shared) {
+        self.inner.close_transport(self.runtime.now(), close);
         self.terminate(ConnectionError::LocallyClosed, shared);
         self.wake();
     }
