@@ -2166,6 +2166,13 @@ impl Connection {
     ///
     /// Decrypting the first packet in the `Endpoint` allows stateless packet handling to be more
     /// efficient.
+    /// Numbers the server's Initial packets from `next` on, after those its endpoint sent
+    /// acknowledging the client's (see [`crate::Endpoint::acknowledge`])
+    pub(crate) fn continue_initial_packet_numbers(&mut self, next: u64) {
+        let space = &mut self.spaces[SpaceId::Initial];
+        space.next_packet_number = space.next_packet_number.max(next);
+    }
+
     pub(crate) fn handle_first_packet(
         &mut self,
         now: Instant,

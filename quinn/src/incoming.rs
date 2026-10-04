@@ -30,6 +30,15 @@ impl Incoming {
         state.endpoint.first_flight(&state.inner)
     }
 
+    /// Acknowledges the client's Initial packets received so far, without answering its
+    /// handshake (see [`proto::Endpoint::acknowledge`]): one whose handshake waits on
+    /// something else then measures its RTT from the acknowledgement. It can no longer be sent a
+    /// Retry.
+    pub fn acknowledge(&self) {
+        let state = self.0.as_ref().unwrap();
+        state.endpoint.acknowledge(&state.inner);
+    }
+
     /// Attempt to accept this incoming connection (an error may still occur)
     pub fn accept(mut self) -> Result<Connecting, ConnectionError> {
         let state = self.0.take().unwrap();

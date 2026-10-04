@@ -462,6 +462,14 @@ impl EndpointInner {
         Ok(())
     }
 
+    pub(crate) fn acknowledge(&self, incoming: &proto::Incoming) {
+        let mut state = self.state.lock().unwrap();
+        let mut response_buffer = Vec::new();
+        if let Some(transmit) = state.inner.acknowledge(incoming, &mut response_buffer) {
+            respond(transmit, &response_buffer, &*state.socket);
+        }
+    }
+
     pub(crate) fn first_flight(&self, incoming: &proto::Incoming) -> proto::FirstFlight {
         self.state
             .lock()

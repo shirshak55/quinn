@@ -30,6 +30,7 @@ use crate::{
         ConnectionIdParser, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket,
         Packet, PacketDecodeError, PacketNumber, PartialDecode, ProtectedInitialHeader,
     },
+    range_set::ArrayRangeSet,
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner, IssuedCid,
@@ -520,6 +521,7 @@ impl Endpoint {
                 addresses,
                 &crypto,
                 &header.src_cid,
+                None,
                 reason,
                 buf,
             )));
@@ -553,6 +555,7 @@ impl Endpoint {
                     addresses,
                     &crypto,
                     &header.src_cid,
+                    None,
                     TransportError::INVALID_TOKEN(""),
                     buf,
                 )));
@@ -563,6 +566,7 @@ impl Endpoint {
             server_config,
             datagrams: Vec::new(),
             total_bytes: 0,
+            acknowledged: None,
         });
         self.index
             .insert_initial_incoming(header.dst_cid, incoming_idx);
@@ -582,6 +586,74 @@ impl Endpoint {
             incoming_idx,
             improper_drop_warner: IncomingImproperDropWarner,
         }))
+    }
+
+    /// Acknowledges the client's Initial packets `incoming` received so far, ahead of the
+    /// server's handshake: an Initial packet carrying only an ACK frame, sent from the connection
+    /// ID the connection keeps once accepted, whose Initial packet numbers continue from it. The
+    /// client takes its first RTT sample from it rather than from a handshake answered late. A
+    /// client acknowledged can't be sent a Retry, and is refused from the same connection ID.
+    /// `None` when the endpoint's connection IDs are zero-length, which can't route the client's
+    /// next packets to `incoming`.
+    pub fn acknowledge(&mut self, incoming: &Incoming, buf: &mut Vec<u8>) -> Option<Transmit> {
+        if self.local_cid_generator.cid_len() == 0 {
+            return None;
+        }
+        let mut ranges = ArrayRangeSet::new();
+        for (number, _) in self.incoming_first_flight(incoming).packets {
+            ranges.insert_one(number);
+        }
+        if ranges.is_empty() {
+            return None;
+        }
+        let buffer = &self.incoming_buffers[incoming.incoming_idx];
+        let (loc_cid, number) = match buffer.acknowledged {
+            Some(Acknowledged {
+                loc_cid,
+                next_packet_number,
+            }) => (loc_cid, next_packet_number),
+            None => {
+                let number = buffer.server_config.transport.initial_packet_number;
+                let loc_cid = loop {
+                    let cid = self.local_cid_generator.generate_cid();
+                    if !self.index.connection_ids.contains_key(&cid)
+                        && !self.index.connection_ids_initial.contains_key(&cid)
+                    {
+                        break cid;
+                    }
+                };
+                // The client sends its next Initial and 0-RTT packets to it
+                self.index
+                    .insert_initial_incoming(loc_cid, incoming.incoming_idx);
+                (loc_cid, number)
+            }
+        };
+        self.incoming_buffers[incoming.incoming_idx].acknowledged = Some(Acknowledged {
+            loc_cid,
+            next_packet_number: number + 1,
+        });
+        let header = Header::Initial(InitialHeader {
+            dst_cid: incoming.packet.header.src_cid,
+            src_cid: loc_cid,
+            number: PacketNumber::new(number, 0),
+            token: Bytes::new(),
+            version: incoming.packet.header.version,
+        });
+        let partial_encode = header.encode(buf);
+        frame::Ack::encode(0, &ranges, None, buf);
+        buf.resize(buf.len() + incoming.crypto.packet.local.tag_len(), 0);
+        partial_encode.finish(
+            buf,
+            &*incoming.crypto.header.local,
+            Some((number, &*incoming.crypto.packet.local)),
+        );
+        Some(Transmit {
+            destination: incoming.addresses.remote,
+            ecn: None,
+            size: buf.len(),
+            segment_size: None,
+            src_ip: incoming.addresses.local_ip,
+        })
     }
 
     /// What the client's packets for `incoming` carried so far: its first Initial and those
@@ -670,6 +742,10 @@ impl Endpoint {
         incoming.improper_drop_warner.dismiss();
         let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
+        let acknowledged = incoming_buffer.acknowledged;
+        if let Some(acknowledged) = acknowledged {
+            self.index.remove_initial(acknowledged.loc_cid);
+        }
 
         let packet_number = incoming.packet.header.number.expand(0);
         let InitialHeader {
@@ -705,6 +781,7 @@ impl Endpoint {
                     incoming.addresses,
                     &incoming.crypto,
                     &src_cid,
+                    acknowledged,
                     TransportError::CONNECTION_REFUSED(""),
                     buf,
                 )),
@@ -731,7 +808,13 @@ impl Endpoint {
         };
 
         let ch = ConnectionHandle(self.connections.vacant_key());
-        let loc_cid = self.new_cid(ch);
+        let loc_cid = match acknowledged {
+            Some(acknowledged) => {
+                self.index.connection_ids.insert(acknowledged.loc_cid, ch);
+                acknowledged.loc_cid
+            }
+            None => self.new_cid(ch),
+        };
         let mut params = TransportParameters::new(
             &server_config.transport,
             &self.config,
@@ -774,6 +857,9 @@ impl Endpoint {
             },
         );
         self.index.insert_initial(dst_cid, ch);
+        if let Some(acknowledged) = acknowledged {
+            conn.continue_initial_packet_numbers(acknowledged.next_packet_number);
+        }
 
         match conn.handle_first_packet(
             incoming.received_at,
@@ -801,6 +887,7 @@ impl Endpoint {
                         incoming.addresses,
                         &incoming.crypto,
                         &src_cid,
+                        acknowledged,
                         e.clone(),
                         buf,
                     )),
@@ -838,7 +925,7 @@ impl Endpoint {
 
     /// Reject this incoming connection attempt
     pub fn refuse(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Transmit {
-        self.clean_up_incoming(&incoming);
+        let acknowledged = self.clean_up_incoming(&incoming);
         incoming.improper_drop_warner.dismiss();
 
         self.initial_close(
@@ -846,6 +933,7 @@ impl Endpoint {
             incoming.addresses,
             &incoming.crypto,
             &incoming.packet.header.src_cid,
+            acknowledged,
             TransportError::CONNECTION_REFUSED(""),
             buf,
         )
@@ -853,9 +941,14 @@ impl Endpoint {
 
     /// Respond with a retry packet, requiring the client to retry with address validation
     ///
-    /// Errors if `incoming.may_retry()` is false.
+    /// Errors if `incoming.may_retry()` is false, or its client was acknowledged (see
+    /// [`Endpoint::acknowledge`]), which then discards a Retry.
     pub fn retry(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Result<Transmit, RetryError> {
-        if !incoming.may_retry() {
+        if !incoming.may_retry()
+            || self.incoming_buffers[incoming.incoming_idx]
+                .acknowledged
+                .is_some()
+        {
             return Err(RetryError(Box::new(incoming)));
         }
 
@@ -913,11 +1006,16 @@ impl Endpoint {
         incoming.improper_drop_warner.dismiss();
     }
 
-    /// Clean up endpoint data structures associated with an `Incoming`.
-    fn clean_up_incoming(&mut self, incoming: &Incoming) {
+    /// Clean up endpoint data structures associated with an `Incoming`, returning how its
+    /// client was acknowledged.
+    fn clean_up_incoming(&mut self, incoming: &Incoming) -> Option<Acknowledged> {
         self.index.remove_initial(incoming.packet.header.dst_cid);
         let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
+        if let Some(acknowledged) = incoming_buffer.acknowledged {
+            self.index.remove_initial(acknowledged.loc_cid);
+        }
+        incoming_buffer.acknowledged
     }
 
     fn add_connection(
@@ -989,24 +1087,30 @@ impl Endpoint {
         conn
     }
 
+    /// A CONNECTION_CLOSE for `reason` in an Initial packet: from the connection ID and with the
+    /// packet number that follow the client's acknowledgement, when it was `acknowledged`
+    #[allow(clippy::too_many_arguments)]
     fn initial_close(
         &mut self,
         version: u32,
         addresses: FourTuple,
         crypto: &Keys,
         remote_id: &ConnectionId,
+        acknowledged: Option<Acknowledged>,
         reason: TransportError,
         buf: &mut Vec<u8>,
     ) -> Transmit {
         // We don't need to worry about CID collisions in initial closes because the peer
         // shouldn't respond, and if it does, and the CID collides, we'll just drop the
         // unexpected response.
-        let local_id = self.local_cid_generator.generate_cid();
-        let number = PacketNumber::U8(0);
+        let (local_id, number) = match acknowledged {
+            Some(acknowledged) => (acknowledged.loc_cid, acknowledged.next_packet_number),
+            None => (self.local_cid_generator.generate_cid(), 0),
+        };
         let header = Header::Initial(InitialHeader {
             dst_cid: *remote_id,
             src_cid: local_id,
-            number,
+            number: PacketNumber::new(number, 0),
             token: Bytes::new(),
             version,
         });
@@ -1016,7 +1120,11 @@ impl Endpoint {
             INITIAL_MTU as usize - partial_encode.header_len - crypto.packet.local.tag_len();
         frame::Close::from(reason).encode(buf, max_len);
         buf.resize(buf.len() + crypto.packet.local.tag_len(), 0);
-        partial_encode.finish(buf, &*crypto.header.local, Some((0, &*crypto.packet.local)));
+        partial_encode.finish(
+            buf,
+            &*crypto.header.local,
+            Some((number, &*crypto.packet.local)),
+        );
         Transmit {
             destination: addresses.remote,
             ecn: None,
@@ -1150,6 +1258,17 @@ struct IncomingBuffer {
     server_config: Arc<ServerConfig>,
     datagrams: Vec<DatagramConnectionEvent>,
     total_bytes: u64,
+    /// Set once the client's Initial packets were acknowledged (see [`Endpoint::acknowledge`])
+    acknowledged: Option<Acknowledged>,
+}
+
+/// How a pending incoming connection acknowledged the client's Initial packets
+#[derive(Copy, Clone)]
+struct Acknowledged {
+    /// The connection ID it sent from, which the client now sends to
+    loc_cid: ConnectionId,
+    /// The Initial packet number its next packet takes
+    next_packet_number: u64,
 }
 
 /// Part of protocol state incoming datagrams can be routed to

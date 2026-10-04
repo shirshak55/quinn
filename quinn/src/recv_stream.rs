@@ -295,6 +295,16 @@ impl RecvStream {
         &mut self,
         error_code: VarInt,
     ) -> Result<Option<VarInt>, ResetError> {
+        poll_fn(|cx| self.poll_stop_and_await_end(cx, error_code)).await
+    }
+
+    /// Polls [`Self::stop_and_await_end`]: the first call stops the stream, those after it
+    /// await its end
+    pub fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut Context,
+        error_code: VarInt,
+    ) -> Poll<Result<Option<VarInt>, ResetError>> {
         if let Some(
             proto::ReadError::Reset(code)
             | proto::ReadError::ResetAt {
@@ -302,16 +312,16 @@ impl RecvStream {
             },
         ) = self.reset
         {
-            return Ok(Some(code));
+            return Poll::Ready(Ok(Some(code)));
+        }
+        let mut conn = self.conn.state.lock("RecvStream::stop_and_await_end");
+        if self.is_0rtt && conn.check_0rtt().is_err() {
+            return Poll::Ready(Err(ResetError::ZeroRttRejected));
         }
         // A call cancelled while awaiting the end left the stream stopped: this one awaits it on
         if !self.awaiting_end {
-            let mut conn = self.conn.state.lock("RecvStream::stop_and_await_end");
-            if self.is_0rtt && conn.check_0rtt().is_err() {
-                return Err(ResetError::ZeroRttRejected);
-            }
             if let Some(e) = &conn.error {
-                return Err(e.clone().into());
+                return Poll::Ready(Err(e.clone().into()));
             }
             let ended = conn
                 .inner
@@ -321,32 +331,25 @@ impl RecvStream {
             self.all_data_read = true;
             conn.blocked_readers.remove(&self.stream);
             match ended {
-                Ok(Some(end)) => return Ok(end),
-                Err(_) => return Ok(None),
+                Ok(Some(end)) => return Poll::Ready(Ok(end)),
+                Err(_) => return Poll::Ready(Ok(None)),
                 Ok(None) => {
                     conn.stopped_ends.insert(self.stream, None);
                     self.awaiting_end = true;
                 }
             }
         }
-        poll_fn(|cx| {
-            let mut conn = self.conn.state.lock("RecvStream::stop_and_await_end");
-            if self.is_0rtt && conn.check_0rtt().is_err() {
-                return Poll::Ready(Err(ResetError::ZeroRttRejected));
-            }
-            if let Some(Some(end)) = conn.stopped_ends.get(&self.stream) {
-                let end = *end;
-                conn.stopped_ends.remove(&self.stream);
-                self.awaiting_end = false;
-                return Poll::Ready(Ok(end));
-            }
-            if let Some(e) = &conn.error {
-                return Poll::Ready(Err(e.clone().into()));
-            }
-            conn.blocked_readers.insert(self.stream, cx.waker().clone());
-            Poll::Pending
-        })
-        .await
+        if let Some(Some(end)) = conn.stopped_ends.get(&self.stream) {
+            let end = *end;
+            conn.stopped_ends.remove(&self.stream);
+            self.awaiting_end = false;
+            return Poll::Ready(Ok(end));
+        }
+        if let Some(e) = &conn.error {
+            return Poll::Ready(Err(e.clone().into()));
+        }
+        conn.blocked_readers.insert(self.stream, cx.waker().clone());
+        Poll::Pending
     }
 
     /// Check if this stream has been opened during 0-RTT.
