@@ -18,6 +18,8 @@ pub(super) struct Recv {
     pub(super) sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
+    /// Whether the application awaits how the peer ends this stopped stream
+    pub(super) awaiting_end: bool,
 }
 
 impl Recv {
@@ -28,6 +30,7 @@ impl Recv {
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,
+            awaiting_end: false,
         })
     }
 
@@ -38,6 +41,7 @@ impl Recv {
         self.sent_max_stream_data = initial_max_data;
         self.end = 0;
         self.stopped = false;
+        self.awaiting_end = false;
     }
 
     /// Process a STREAM frame
@@ -255,6 +259,18 @@ impl Recv {
             ));
         }
         Ok(())
+    }
+
+    /// How the peer ended the stream, if it did: with its reset's error code, or `None` by sending
+    /// all of it
+    pub(super) fn ended(&self) -> Option<Option<VarInt>> {
+        match self.state {
+            RecvState::Recv { size: None } => None,
+            RecvState::Recv { size: Some(_) } => Some(None),
+            RecvState::ResetAt { error_code, .. } | RecvState::ResetRecvd { error_code, .. } => {
+                Some(Some(error_code))
+            }
+        }
     }
 
     pub(super) fn reset_code(&self) -> Option<VarInt> {

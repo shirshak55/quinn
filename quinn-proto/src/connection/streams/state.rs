@@ -318,6 +318,10 @@ impl StreamsState {
         // Stopped streams become closed instantly on FIN, so check whether we need to clean up
         if closed {
             let rs = self.recv.remove(&id).flatten().unwrap();
+            if rs.as_open_recv().is_some_and(|rs| rs.awaiting_end) {
+                self.events
+                    .push_back(StreamEvent::StoppedEnded { id, reset: None });
+            }
             self.stream_recv_freed(id, rs);
         }
 
@@ -370,6 +374,12 @@ impl StreamsState {
         if stopped {
             // Stopped streams should be disposed immediately on reset
             let rs = self.recv.remove(&id).flatten().unwrap();
+            if rs.as_open_recv().is_some_and(|rs| rs.awaiting_end) {
+                self.events.push_back(StreamEvent::StoppedEnded {
+                    id,
+                    reset: Some(error_code),
+                });
+            }
             self.stream_recv_freed(id, rs);
         }
         self.on_stream_frame(!stopped, id);

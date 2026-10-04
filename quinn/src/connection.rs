@@ -951,6 +951,7 @@ impl ConnectionRef {
                 blocked_writers: FxHashMap::default(),
                 blocked_readers: FxHashMap::default(),
                 stopped: FxHashMap::default(),
+                stopped_ends: FxHashMap::default(),
                 error: None,
                 io_poller: socket.clone().create_io_poller(),
                 socket,
@@ -1036,6 +1037,9 @@ pub(crate) struct State {
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
+    /// How the peer ended the stopped streams awaiting it (see
+    /// [`RecvStream::stop_and_await_end`]), once it did
+    pub(crate) stopped_ends: FxHashMap<StreamId, Option<Option<VarInt>>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
     socket: Arc<dyn AsyncUdpSocket>,
@@ -1214,6 +1218,12 @@ impl State {
                 Stream(StreamEvent::Stopped { id, .. }) => {
                     wake_stream_notify(id, &mut self.stopped);
                     wake_stream(id, &mut self.blocked_writers);
+                }
+                Stream(StreamEvent::StoppedEnded { id, reset }) => {
+                    if let Some(end) = self.stopped_ends.get_mut(&id) {
+                        *end = Some(reset);
+                        wake_stream(id, &mut self.blocked_readers);
+                    }
                 }
             }
         }

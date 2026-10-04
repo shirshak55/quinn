@@ -55,6 +55,8 @@ pub struct RecvStream {
     is_0rtt: bool,
     all_data_read: bool,
     reset: Option<proto::ReadError>,
+    /// Whether [`Self::stop_and_await_end`] awaits how the peer ends the stream
+    awaiting_end: bool,
 }
 
 impl RecvStream {
@@ -65,6 +67,7 @@ impl RecvStream {
             is_0rtt,
             all_data_read: false,
             reset: None,
+            awaiting_end: false,
         }
     }
 
@@ -281,6 +284,68 @@ impl RecvStream {
         // operation, so `drop` doesn't have to
         conn.blocked_readers.remove(&self.stream);
         Ok(())
+    }
+
+    /// Stop accepting data as [`stop()`](Self::stop) does, then wait for the peer to end the stream
+    ///
+    /// Yields `Some` with the error code of the peer's reset, or `None` if it sent all of the
+    /// stream instead (or all of it was read): a relay can then end the stream it relays this one
+    /// to as the peer ended this one.
+    pub async fn stop_and_await_end(
+        &mut self,
+        error_code: VarInt,
+    ) -> Result<Option<VarInt>, ResetError> {
+        if let Some(
+            proto::ReadError::Reset(code)
+            | proto::ReadError::ResetAt {
+                error_code: code, ..
+            },
+        ) = self.reset
+        {
+            return Ok(Some(code));
+        }
+        {
+            let mut conn = self.conn.state.lock("RecvStream::stop_and_await_end");
+            if self.is_0rtt && conn.check_0rtt().is_err() {
+                return Err(ResetError::ZeroRttRejected);
+            }
+            if let Some(e) = &conn.error {
+                return Err(e.clone().into());
+            }
+            let ended = conn
+                .inner
+                .recv_stream(self.stream)
+                .stop_awaiting_end(error_code);
+            conn.wake();
+            self.all_data_read = true;
+            conn.blocked_readers.remove(&self.stream);
+            match ended {
+                Ok(Some(end)) => return Ok(end),
+                Err(_) => return Ok(None),
+                Ok(None) => {
+                    conn.stopped_ends.insert(self.stream, None);
+                    self.awaiting_end = true;
+                }
+            }
+        }
+        poll_fn(|cx| {
+            let mut conn = self.conn.state.lock("RecvStream::stop_and_await_end");
+            if self.is_0rtt && conn.check_0rtt().is_err() {
+                return Poll::Ready(Err(ResetError::ZeroRttRejected));
+            }
+            if let Some(Some(end)) = conn.stopped_ends.get(&self.stream) {
+                let end = *end;
+                conn.stopped_ends.remove(&self.stream);
+                self.awaiting_end = false;
+                return Poll::Ready(Ok(end));
+            }
+            if let Some(e) = &conn.error {
+                return Poll::Ready(Err(e.clone().into()));
+            }
+            conn.blocked_readers.insert(self.stream, cx.waker().clone());
+            Poll::Pending
+        })
+        .await
     }
 
     /// Check if this stream has been opened during 0-RTT.
@@ -537,6 +602,12 @@ impl tokio::io::AsyncRead for RecvStream {
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
+        if self.awaiting_end {
+            let mut conn = self.conn.state.lock("RecvStream::drop");
+            conn.stopped_ends.remove(&self.stream);
+            conn.blocked_readers.remove(&self.stream);
+            return;
+        }
         if self.all_data_read {
             debug_assert!(
                 !self
