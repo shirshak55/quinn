@@ -745,6 +745,17 @@ impl Connection {
             .mark_stream_relayed(id);
     }
 
+    /// Mark the peer's streams of `id`'s direction from `id` on as relayed
+    ///
+    /// See [`proto::Connection::mark_streams_relayed_from()`].
+    pub fn mark_streams_relayed_from(&self, id: StreamId) {
+        self.0
+            .state
+            .lock("mark_streams_relayed_from")
+            .inner
+            .mark_streams_relayed_from(id);
+    }
+
     /// What this client connection sent before the server's first datagram arrived
     ///
     /// See [`proto::Connection::sent_first_flight()`].

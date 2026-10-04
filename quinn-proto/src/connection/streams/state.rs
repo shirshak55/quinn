@@ -102,6 +102,9 @@ pub struct StreamsState {
     unrelayed_freed: [u64; 2],
     /// Remotely-initiated streams marked relayed (see `mark_relayed`) and not yet fully closed
     relayed: FxHashSet<StreamId>,
+    /// Index of the remotely-initiated stream from which on all count as marked relayed, per
+    /// direction (see `mark_relayed_from`)
+    relayed_from: [Option<u64>; 2],
     /// Size of the desired stream flow control window. May be smaller than `allocated_remote_count`
     /// due to `set_max_concurrent` calls.
     max_concurrent_remote_count: [u64; 2],
@@ -191,6 +194,7 @@ impl StreamsState {
             remote_total: [None, None],
             unrelayed_freed: [0, 0],
             relayed: FxHashSet::default(),
+            relayed_from: [None, None],
             max_concurrent_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
             flow_control_adjusted: false,
             next_remote: [0, 0],
@@ -1096,6 +1100,15 @@ impl StreamsState {
         }
     }
 
+    /// Marks the peer's streams of `id`'s direction from `id` on as relayed, as
+    /// [`Self::mark_relayed`] marks one
+    pub(crate) fn mark_relayed_from(&mut self, id: StreamId) {
+        if id.initiator() != self.side {
+            let from = &mut self.relayed_from[id.dir() as usize];
+            *from = Some(from.map_or(id.index(), |from| from.min(id.index())));
+        }
+    }
+
     pub(crate) fn local_concurrency(&self, dir: Dir) -> u64 {
         self.max[dir as usize].saturating_sub(self.local_freed[dir as usize])
     }
@@ -1189,7 +1202,9 @@ impl StreamsState {
             };
         if fully_free && id.initiator() != self.side {
             self.allocated_remote_count[id.dir() as usize] -= 1;
-            if !self.relayed.remove(&id) && self.remote_total[id.dir() as usize].is_some() {
+            let relayed = self.relayed.remove(&id)
+                || self.relayed_from[id.dir() as usize].is_some_and(|from| id.index() >= from);
+            if !relayed && self.remote_total[id.dir() as usize].is_some() {
                 self.unrelayed_freed[id.dir() as usize] += 1;
             }
             self.ensure_remote_streams(id.dir());

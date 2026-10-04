@@ -1554,6 +1554,12 @@ impl Connection {
         self.streams.mark_relayed(id);
     }
 
+    /// Mark the peer's streams of `id`'s direction from `id` on as relayed, as
+    /// [`mark_stream_relayed`](Self::mark_stream_relayed) marks one
+    pub fn mark_streams_relayed_from(&mut self, id: StreamId) {
+        self.streams.mark_relayed_from(id);
+    }
+
     /// What this client connection sent before the server's first datagram arrived: each
     /// datagram's size, each Initial packet's number and encoded number length, whether 0-RTT
     /// packets went, and its first Initial's version and connection ID and token lengths
