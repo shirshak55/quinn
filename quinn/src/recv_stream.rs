@@ -304,7 +304,8 @@ impl RecvStream {
         {
             return Ok(Some(code));
         }
-        {
+        // A call cancelled while awaiting the end left the stream stopped: this one awaits it on
+        if !self.awaiting_end {
             let mut conn = self.conn.state.lock("RecvStream::stop_and_await_end");
             if self.is_0rtt && conn.check_0rtt().is_err() {
                 return Err(ResetError::ZeroRttRejected);

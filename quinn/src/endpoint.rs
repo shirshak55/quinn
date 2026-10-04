@@ -759,12 +759,12 @@ impl RecvState {
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments
-                * BATCH_SIZE
-        ];
+        // A slot takes one datagram, or the segments GRO coalesced, which Linux keeps under
+        // 64 KiB with their headers (GRO_LEGACY_MAX_SIZE for all but TCP)
+        let slot = (endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
+            * max_receive_segments)
+            .min(64 * 1024);
+        let recv_buf = vec![0; slot * BATCH_SIZE];
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),

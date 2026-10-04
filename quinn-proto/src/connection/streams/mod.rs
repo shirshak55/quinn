@@ -71,12 +71,14 @@ impl<'a> Streams<'a> {
         }
 
         let x = self.state.next_reported_remote[dir as usize];
+        let id = StreamId::new(!self.state.side, dir, x);
+        self.state.insert_remote_through(id);
         self.state.next_reported_remote[dir as usize] = x + 1;
         if dir == Dir::Bi {
             self.state.send_streams += 1;
         }
 
-        Some(StreamId::new(!self.state.side, dir, x))
+        Some(id)
     }
 
     #[cfg(fuzzing)]
@@ -95,9 +97,9 @@ impl<'a> Streams<'a> {
     /// These streams count against the respective concurrency limit reported by
     /// [`Connection::max_concurrent_streams`](super::Connection::max_concurrent_streams).
     pub fn remote_open_streams(&self, dir: Dir) -> u64 {
-        // total opened - total closed = total opened - ( total allocated - total allocated unclosed )
+        // total opened - total closed = total opened - ( total granted - total granted unclosed )
         self.state.next_remote[dir as usize]
-            - (self.state.inserted_remote[dir as usize]
+            - (self.state.max_remote[dir as usize]
                 - self.state.allocated_remote_count[dir as usize])
     }
 }

@@ -39,6 +39,7 @@ fuzz_target!(|input: (StreamParams, Vec<Operation>)| {
         params.send_window.into(),
         params.receive_window.into(),
         params.stream_receive_window.into(),
+        None,
     );
 
     for operation in operations {
@@ -53,7 +54,7 @@ fuzz_target!(|input: (StreamParams, Vec<Operation>)| {
                 let _ = SendStream::new(id, &mut state, &mut pending, &conn_state).finish();
             }
             Operation::ReceivedStopSending(sid, err_code) => {
-                Streams::new(&mut state, &conn_state)
+                let _ = Streams::new(&mut state, &conn_state)
                     .state()
                     .received_stop_sending(sid, err_code);
             }

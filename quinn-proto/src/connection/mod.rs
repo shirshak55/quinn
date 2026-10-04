@@ -385,6 +385,7 @@ impl Connection {
                 config.send_window,
                 config.receive_window,
                 config.stream_receive_windows(),
+                config.stream_concurrency_cap,
             ),
             datagrams: DatagramState::default(),
             rem_cids: CidQueue::new(rem_cid, config.active_connection_id_limit as usize),
@@ -458,6 +459,7 @@ impl Connection {
     #[must_use]
     pub fn recv_stream(&mut self, id: StreamId) -> RecvStream<'_> {
         assert!(id.dir() == Dir::Bi || id.initiator() != self.side.side());
+        self.streams.insert_remote_through(id);
         RecvStream {
             id,
             state: &mut self.streams,
@@ -469,6 +471,7 @@ impl Connection {
     #[must_use]
     pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
         assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
+        self.streams.insert_remote_through(id);
         SendStream {
             id,
             state: &mut self.streams,
@@ -3015,6 +3018,7 @@ impl Connection {
                             "STREAM_DATA_BLOCKED on send-only stream",
                         ));
                     }
+                    self.streams.check_remote_limit(id)?;
                     debug!(
                         stream = %id,
                         offset, "peer claims to be blocked at stream level"
@@ -3044,7 +3048,7 @@ impl Connection {
                             "STOP_SENDING on unopened stream",
                         ));
                     }
-                    self.streams.received_stop_sending(id, error_code);
+                    self.streams.received_stop_sending(id, error_code)?;
                 }
                 Frame::RetireConnectionId { sequence } => {
                     let allow_more_cids = self

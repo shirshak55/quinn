@@ -295,7 +295,8 @@ impl ConnectionClose {
         let ty = self.frame_type.map_or(0, |x| x.0);
         out.write_var(ty); // <= 8 bytes
         let max_len = max_len
-            - 3
+            - 1
+            - VarInt::from_u64(self.error_code.into()).unwrap().size()
             - VarInt::from_u64(ty).unwrap().size()
             - VarInt::from_u64(self.reason.len() as u64).unwrap().size();
         let actual_len = self.reason.len().min(max_len);
@@ -335,7 +336,10 @@ impl ApplicationClose {
     pub(crate) fn encode<W: BufMut>(&self, out: &mut W, max_len: usize) {
         out.write(FrameType::APPLICATION_CLOSE); // 1 byte
         out.write(self.error_code); // <= 8 bytes
-        let max_len = max_len - 3 - VarInt::from_u64(self.reason.len() as u64).unwrap().size();
+        let max_len = max_len
+            - 1
+            - self.error_code.size()
+            - VarInt::from_u64(self.reason.len() as u64).unwrap().size();
         let actual_len = self.reason.len().min(max_len);
         out.write_var(actual_len as u64); // <= 8 bytes
         out.put_slice(&self.reason[0..actual_len]); // whatever's left

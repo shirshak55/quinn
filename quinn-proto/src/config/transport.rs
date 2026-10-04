@@ -28,6 +28,7 @@ use crate::{
 pub struct TransportConfig {
     pub(crate) max_concurrent_bidi_streams: VarInt,
     pub(crate) max_concurrent_uni_streams: VarInt,
+    pub(crate) stream_concurrency_cap: Option<VarInt>,
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
     pub(crate) stream_receive_window_bidi_local: Option<VarInt>,
@@ -54,6 +55,7 @@ pub struct TransportConfig {
     pub(crate) reset_stream_at: bool,
     pub(crate) min_packet_number_len: u8,
     pub(crate) early_key_update: bool,
+    pub(crate) send_greased_quic_bit: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -87,6 +89,17 @@ impl TransportConfig {
     /// Variant of `max_concurrent_bidi_streams` affecting unidirectional streams
     pub fn max_concurrent_uni_streams(&mut self, value: VarInt) -> &mut Self {
         self.max_concurrent_uni_streams = value;
+        self
+    }
+
+    /// Most incoming streams of each direction that may be open concurrently, whatever
+    /// `max_concurrent_*_streams` or `Connection::set_max_remote_streams` grant
+    ///
+    /// A grant past it waits for the peer's streams to close. With transport parameters sent by a
+    /// crypto session announcing more, a stream past it is a STREAM_LIMIT_ERROR. Defaults to
+    /// `None`: no cap.
+    pub fn stream_concurrency_cap(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_concurrency_cap = value;
         self
     }
 
@@ -369,6 +382,15 @@ impl TransportConfig {
         self
     }
 
+    /// Whether to grease the QUIC bit (RFC 9287) of the packets sent, clearing it at random, where
+    /// the peer announced grease_quic_bit
+    ///
+    /// Defaults to `true`.
+    pub fn send_greased_quic_bit(&mut self, value: bool) -> &mut Self {
+        self.send_greased_quic_bit = value;
+        self
+    }
+
     /// The shortest acknowledgement delay this endpoint lets the peer request with an
     /// ACK_FREQUENCY frame, which it advertises as its min_ack_delay transport parameter (in
     /// microseconds)
@@ -570,6 +592,7 @@ impl Default for TransportConfig {
         Self {
             max_concurrent_bidi_streams: 100u32.into(),
             max_concurrent_uni_streams: 100u32.into(),
+            stream_concurrency_cap: None,
             // 30 second default recommended by RFC 9308 § 3.2
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
@@ -597,6 +620,7 @@ impl Default for TransportConfig {
             reset_stream_at: false,
             min_packet_number_len: 1,
             early_key_update: true,
+            send_greased_quic_bit: true,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -622,6 +646,7 @@ impl fmt::Debug for TransportConfig {
         let Self {
             max_concurrent_bidi_streams,
             max_concurrent_uni_streams,
+            stream_concurrency_cap,
             max_idle_timeout,
             stream_receive_window,
             stream_receive_window_bidi_local,
@@ -647,6 +672,7 @@ impl fmt::Debug for TransportConfig {
             reset_stream_at,
             min_packet_number_len,
             early_key_update,
+            send_greased_quic_bit,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -664,6 +690,7 @@ impl fmt::Debug for TransportConfig {
 
         s.field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
             .field("max_concurrent_uni_streams", max_concurrent_uni_streams)
+            .field("stream_concurrency_cap", stream_concurrency_cap)
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
             .field(
@@ -695,6 +722,7 @@ impl fmt::Debug for TransportConfig {
             .field("reset_stream_at", reset_stream_at)
             .field("min_packet_number_len", min_packet_number_len)
             .field("early_key_update", early_key_update)
+            .field("send_greased_quic_bit", send_greased_quic_bit)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",
