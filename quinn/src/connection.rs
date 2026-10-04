@@ -271,6 +271,7 @@ impl Future for ConnectionDriver {
         conn.forward_endpoint_events();
         conn.forward_app_events(&self.conn.shared);
         conn.forward_stream_concurrency(&self.conn.shared);
+        conn.forward_pings(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -611,6 +612,53 @@ impl Connection {
     /// fixed for the lifetime of the connection.
     pub fn stable_id(&self) -> usize {
         self.0.stable_id()
+    }
+
+    /// Whether the connection's handshake is still in progress
+    ///
+    /// See [`proto::Connection::is_handshaking()`]. A server connection processes no 1-RTT
+    /// packet before its handshake completes: what it received while this holds came in 0-RTT.
+    pub fn is_handshaking(&self) -> bool {
+        self.0.state.lock("is_handshaking").inner.is_handshaking()
+    }
+
+    /// Send the peer a PING frame, in an ack-eliciting packet
+    ///
+    /// See [`proto::Connection::ping()`].
+    pub fn ping(&self) {
+        let mut conn = self.0.state.lock("ping");
+        conn.inner.ping();
+        conn.wake();
+    }
+
+    /// Resolves once a PING frame from the peer arrived, as `stats().frame_rx.ping` counts them
+    ///
+    /// One arriving after this is called wakes it, so it is called before reading the count.
+    pub fn ping_received(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.0.shared.ping_received.notified()
+    }
+
+    /// Stop answering the peer until the idle timeout ends the connection silently
+    ///
+    /// See [`proto::Connection::fall_silent()`].
+    pub fn fall_silent(&self) {
+        let mut conn = self.0.state.lock("fall_silent");
+        conn.inner.fall_silent();
+        conn.wake();
+    }
+
+    /// Drop the connection's state without telling the peer, ending it with
+    /// [`ConnectionError::LocallyClosed`]
+    ///
+    /// See [`proto::Connection::abandon()`].
+    pub fn abandon(&self) {
+        let conn = &mut *self.0.state.lock("abandon");
+        if conn.error.is_some() {
+            return;
+        }
+        conn.inner.abandon();
+        conn.terminate(ConnectionError::LocallyClosed, &self.0.shared);
+        conn.wake();
     }
 
     /// Update traffic keys spontaneously
@@ -1024,6 +1072,7 @@ impl ConnectionRef {
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
                 stream_concurrency: [[0; 3]; 2],
+                pings: 0,
             }),
             shared: Shared::default(),
         }))
@@ -1084,6 +1133,8 @@ pub(crate) struct Shared {
     closed: Notify,
     /// Notified when the driver sees `local_stream_concurrency` change
     stream_concurrency_changed: Notify,
+    /// Notified when the driver sees a PING frame from the peer arrive
+    ping_received: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
 }
@@ -1115,6 +1166,8 @@ pub(crate) struct State {
     buffered_transmit: Option<proto::Transmit>,
     /// The local stream concurrency, limit and streams opened per direction the driver last saw
     stream_concurrency: [[u64; 3]; 2],
+    /// How many PING frames from the peer the driver last saw arrived
+    pings: u64,
 }
 
 impl State {
@@ -1238,6 +1291,15 @@ impl State {
         if concurrency != self.stream_concurrency {
             self.stream_concurrency = concurrency;
             shared.stream_concurrency_changed.notify_waiters();
+        }
+    }
+
+    /// Wakes the tasks waiting for a PING frame from the peer, if one arrived
+    fn forward_pings(&mut self, shared: &Shared) {
+        let pings = self.inner.stats().frame_rx.ping;
+        if pings != self.pings {
+            self.pings = pings;
+            shared.ping_received.notify_waiters();
         }
     }
 

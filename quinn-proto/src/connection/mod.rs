@@ -245,6 +245,8 @@ pub struct Connection {
     stats: ConnectionStats,
     /// What a client connection sent before the server's first datagram arrived
     sent_flight: Option<FirstFlight>,
+    /// Whether the connection stopped answering the peer (see [`Self::fall_silent`])
+    silent: bool,
     /// QUIC version used for the connection.
     version: u32,
 }
@@ -393,6 +395,7 @@ impl Connection {
             rng,
             stats: ConnectionStats::default(),
             sent_flight,
+            silent: false,
             version,
         };
         if path_validated {
@@ -497,6 +500,9 @@ impl Connection {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
+        if self.silent {
+            return None;
+        }
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
             true => max_datagrams,
@@ -1192,6 +1198,9 @@ impl Connection {
                 first_decode,
                 remaining,
             }) => {
+                if self.silent {
+                    return;
+                }
                 // If this packet could initiate a migration and we're a client or a server that
                 // forbids migration, drop the datagram. This could be relaxed to heuristically
                 // permit NAT-rebinding-like migration.
@@ -1376,6 +1385,21 @@ impl Connection {
     /// Causes an ACK-eliciting packet to be transmitted.
     pub fn ping(&mut self) {
         self.spaces[self.highest_space].ping_pending = true;
+    }
+
+    /// Stop answering the peer, as an endpoint whose path to it failed: the datagrams it sends
+    /// are dropped and nothing is sent, a close included, until the idle timeout ends the
+    /// connection silently ([`ConnectionError::TimedOut`]), as it ends the peer's
+    pub fn fall_silent(&mut self) {
+        self.silent = true;
+    }
+
+    /// Drop the connection's state without telling the peer, as an endpoint that lost it: the
+    /// endpoint answers the peer's later packets with stateless resets
+    pub fn abandon(&mut self) {
+        if !self.state.is_drained() {
+            self.kill(ConnectionError::LocallyClosed);
+        }
     }
 
     /// Update traffic keys spontaneously
