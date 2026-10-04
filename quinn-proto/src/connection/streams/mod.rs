@@ -95,9 +95,9 @@ impl<'a> Streams<'a> {
     /// These streams count against the respective concurrency limit reported by
     /// [`Connection::max_concurrent_streams`](super::Connection::max_concurrent_streams).
     pub fn remote_open_streams(&self, dir: Dir) -> u64 {
-        // total opened - total closed = total opened - ( total permitted - total permitted unclosed )
+        // total opened - total closed = total opened - ( total allocated - total allocated unclosed )
         self.state.next_remote[dir as usize]
-            - (self.state.max_remote[dir as usize]
+            - (self.state.inserted_remote[dir as usize]
                 - self.state.allocated_remote_count[dir as usize])
     }
 }

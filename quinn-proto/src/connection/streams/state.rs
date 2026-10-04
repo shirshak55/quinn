@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::BufMut;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, trace};
 
 use super::{
@@ -91,6 +91,17 @@ pub struct StreamsState {
     sent_max_remote: [u64; 2],
     /// Number of streams that we've given the peer permission to open and which aren't fully closed
     pub(super) allocated_remote_count: [u64; 2],
+    /// Number of remotely-initiated streams whose state was allocated: `max_remote`, unless
+    /// `remote_total` grants streams that are allocated as the peer opens them
+    pub(super) inserted_remote: [u64; 2],
+    /// Number of remotely-initiated streams granted over the lifetime of the connection, per
+    /// direction, set by `set_max_remote` in place of `max_concurrent_remote_count`
+    remote_total: [Option<u64>; 2],
+    /// Number of remotely-initiated streams fully closed without having been marked relayed,
+    /// per direction: each grants the peer one more stream past `remote_total`
+    unrelayed_freed: [u64; 2],
+    /// Remotely-initiated streams marked relayed (see `mark_relayed`) and not yet fully closed
+    relayed: FxHashSet<StreamId>,
     /// Size of the desired stream flow control window. May be smaller than `allocated_remote_count`
     /// due to `set_max_concurrent` calls.
     max_concurrent_remote_count: [u64; 2],
@@ -176,6 +187,10 @@ impl StreamsState {
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
             sent_max_remote: [max_remote_bi.into(), max_remote_uni.into()],
             allocated_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
+            inserted_remote: [max_remote_bi.into(), max_remote_uni.into()],
+            remote_total: [None, None],
+            unrelayed_freed: [0, 0],
+            relayed: FxHashSet::default(),
             max_concurrent_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
             flow_control_adjusted: false,
             next_remote: [0, 0],
@@ -237,7 +252,18 @@ impl StreamsState {
 
     /// Ensure we have space for at least a full flow control window of remotely-initiated streams
     /// to be open, and notify the peer if the window has moved
+    ///
+    /// Under `remote_total`, grants the peer that many streams plus one per stream freed
+    /// unrelayed instead, allocating none until the peer opens them.
     fn ensure_remote_streams(&mut self, dir: Dir) {
+        if let Some(total) = self.remote_total[dir as usize] {
+            let total = total
+                .saturating_add(self.unrelayed_freed[dir as usize])
+                .min(MAX_STREAM_COUNT);
+            let max_remote = &mut self.max_remote[dir as usize];
+            *max_remote = total.max(*max_remote);
+            return;
+        }
         let new_count = self.max_concurrent_remote_count[dir as usize]
             .saturating_sub(self.allocated_remote_count[dir as usize]);
         for i in 0..new_count {
@@ -246,6 +272,22 @@ impl StreamsState {
         }
         self.allocated_remote_count[dir as usize] += new_count;
         self.max_remote[dir as usize] += new_count;
+        self.inserted_remote[dir as usize] += new_count;
+    }
+
+    /// Allocates the state of the peer's streams up to `id`, which opening `id` opens, when
+    /// granted (see [`Self::ensure_remote_streams`]) but not allocated yet
+    fn insert_remote_through(&mut self, id: StreamId) {
+        let dir = id.dir() as usize;
+        if id.initiator() == self.side || id.index() >= self.max_remote[dir] {
+            return;
+        }
+        while self.inserted_remote[dir] <= id.index() {
+            let id = StreamId::new(!self.side, id.dir(), self.inserted_remote[dir]);
+            self.insert(true, id);
+            self.inserted_remote[dir] += 1;
+            self.allocated_remote_count[dir] += 1;
+        }
     }
 
     pub(crate) fn zero_rtt_rejected(&mut self) {
@@ -446,6 +488,7 @@ impl StreamsState {
     /// Process incoming `STOP_SENDING` frame
     #[allow(unreachable_pub)] // fuzzing only
     pub fn received_stop_sending(&mut self, id: StreamId, error_code: VarInt) {
+        self.insert_remote_through(id);
         let max_send_data = self.max_send_data(id);
         let stream = match self
             .send
@@ -910,6 +953,7 @@ impl StreamsState {
             ));
         }
 
+        self.insert_remote_through(id);
         let write_limit = self.write_limit();
         let max_send_data = self.max_send_data(id);
         if let Some(ss) = self
@@ -982,8 +1026,12 @@ impl StreamsState {
         for dir in Dir::iter() {
             let diff = self.max_remote[dir as usize] - self.sent_max_remote[dir as usize];
             // To reduce traffic, only announce updates if at least 1/8 of the flow control window
-            // has been consumed.
-            if diff > self.max_concurrent_remote_count[dir as usize] / 8 {
+            // has been consumed; a total set by `set_max_remote` goes out as it is.
+            let threshold = match self.remote_total[dir as usize] {
+                Some(_) => 0,
+                None => self.max_concurrent_remote_count[dir as usize] / 8,
+            };
+            if diff > threshold {
                 pending.max_stream_id[dir as usize] = true;
                 queued = true;
             }
@@ -1012,6 +1060,7 @@ impl StreamsState {
             if id.index() >= limit {
                 return Err(TransportError::STREAM_LIMIT_ERROR(""));
             }
+            self.insert_remote_through(id);
         }
         Ok(())
     }
@@ -1027,8 +1076,39 @@ impl StreamsState {
         self.ensure_remote_streams(dir);
     }
 
+    /// Grants the peer `total` streams of `dir` over the lifetime of the connection, plus one for
+    /// each of its streams fully closed without having been marked relayed (see
+    /// [`Self::mark_relayed`]), in place of `max_concurrent_remote_count` from now on
+    pub(crate) fn set_max_remote(&mut self, dir: Dir, total: VarInt) {
+        self.flow_control_adjusted = true;
+        self.remote_total[dir as usize] = Some(total.into());
+        self.ensure_remote_streams(dir);
+    }
+
+    /// Marks the peer's stream `id`, not fully closed yet, as relayed: under
+    /// [`Self::set_max_remote`], closing it grants the peer no stream
+    pub(crate) fn mark_relayed(&mut self, id: StreamId) {
+        let open = self.recv.contains_key(&id)
+            || self.send.contains_key(&id)
+            || id.index() >= self.inserted_remote[id.dir() as usize];
+        if id.initiator() != self.side && open {
+            self.relayed.insert(id);
+        }
+    }
+
     pub(crate) fn local_concurrency(&self, dir: Dir) -> u64 {
         self.max[dir as usize].saturating_sub(self.local_freed[dir as usize])
+    }
+
+    /// The peer's limit on the locally-initiated streams of `dir` over the lifetime of the
+    /// connection
+    pub(crate) fn local_max(&self, dir: Dir) -> u64 {
+        self.max[dir as usize]
+    }
+
+    /// How many locally-initiated streams of `dir` were opened
+    pub(crate) fn local_opened(&self, dir: Dir) -> u64 {
+        self.next[dir as usize]
     }
 
     pub(crate) fn max_concurrent(&self, dir: Dir) -> u64 {
@@ -1109,6 +1189,9 @@ impl StreamsState {
             };
         if fully_free && id.initiator() != self.side {
             self.allocated_remote_count[id.dir() as usize] -= 1;
+            if !self.relayed.remove(&id) && self.remote_total[id.dir() as usize].is_some() {
+                self.unrelayed_freed[id.dir() as usize] += 1;
+            }
             self.ensure_remote_streams(id.dir());
         } else if fully_free {
             self.local_freed[id.dir() as usize] += 1;

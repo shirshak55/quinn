@@ -693,11 +693,56 @@ impl Connection {
             .local_stream_concurrency(dir)
     }
 
-    /// Resolves once [`Self::local_stream_concurrency()`] changed for either direction
+    /// How many streams of `dir` the peer's limit lets this connection open over its lifetime
+    ///
+    /// See [`proto::Connection::local_max_streams()`].
+    pub fn local_max_streams(&self, dir: Dir) -> u64 {
+        self.0
+            .state
+            .lock("local_max_streams")
+            .inner
+            .local_max_streams(dir)
+    }
+
+    /// How many streams of `dir` this connection opened
+    ///
+    /// See [`proto::Connection::local_streams_opened()`].
+    pub fn local_streams_opened(&self, dir: Dir) -> u64 {
+        self.0
+            .state
+            .lock("local_streams_opened")
+            .inner
+            .local_streams_opened(dir)
+    }
+
+    /// Resolves once [`Self::local_stream_concurrency()`], [`Self::local_max_streams()`] or
+    /// [`Self::local_streams_opened()`] changed for either direction
     ///
     /// A change made after this is called wakes it, so it is called before reading the value.
     pub fn local_stream_concurrency_changed(&self) -> impl Future<Output = ()> + Send + '_ {
         self.0.shared.stream_concurrency_changed.notified()
+    }
+
+    /// Grant the peer `total` streams of `dir` over the connection's lifetime, in place of a
+    /// number open at once
+    ///
+    /// See [`proto::Connection::set_max_remote_streams()`].
+    pub fn set_max_remote_streams(&self, dir: Dir, total: VarInt) {
+        let mut conn = self.0.state.lock("set_max_remote_streams");
+        conn.inner.set_max_remote_streams(dir, total);
+        // May need to send MAX_STREAMS to make progress
+        conn.wake();
+    }
+
+    /// Mark the peer's stream `id` as relayed: closing it grants the peer no stream
+    ///
+    /// See [`proto::Connection::mark_stream_relayed()`].
+    pub fn mark_stream_relayed(&self, id: StreamId) {
+        self.0
+            .state
+            .lock("mark_stream_relayed")
+            .inner
+            .mark_stream_relayed(id);
     }
 
     /// What this client connection sent before the server's first datagram arrived
@@ -967,7 +1012,7 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
-                stream_concurrency: [0; 2],
+                stream_concurrency: [[0; 3]; 2],
             }),
             shared: Shared::default(),
         }))
@@ -1057,8 +1102,8 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
-    /// The local stream concurrency per direction the driver last saw
-    stream_concurrency: [u64; 2],
+    /// The local stream concurrency, limit and streams opened per direction the driver last saw
+    stream_concurrency: [[u64; 3]; 2],
 }
 
 impl State {
@@ -1172,7 +1217,13 @@ impl State {
 
     /// Wakes the tasks waiting for the local stream concurrency to change, if it did
     fn forward_stream_concurrency(&mut self, shared: &Shared) {
-        let concurrency = [Dir::Bi, Dir::Uni].map(|dir| self.inner.local_stream_concurrency(dir));
+        let concurrency = [Dir::Bi, Dir::Uni].map(|dir| {
+            [
+                self.inner.local_stream_concurrency(dir),
+                self.inner.local_max_streams(dir),
+                self.inner.local_streams_opened(dir),
+            ]
+        });
         if concurrency != self.stream_concurrency {
             self.stream_concurrency = concurrency;
             shared.stream_concurrency_changed.notify_waiters();

@@ -1522,6 +1522,38 @@ impl Connection {
         self.streams.local_concurrency(dir)
     }
 
+    /// How many locally initiated streams of `dir` the peer's limit lets this endpoint open over
+    /// the lifetime of the connection: its `initial_max_streams` raised by MAX_STREAMS
+    pub fn local_max_streams(&self, dir: Dir) -> u64 {
+        self.streams.local_max(dir)
+    }
+
+    /// How many locally initiated streams of `dir` this endpoint opened
+    pub fn local_streams_opened(&self, dir: Dir) -> u64 {
+        self.streams.local_opened(dir)
+    }
+
+    /// Grant the peer `total` streams of `dir` over the lifetime of the connection, sending
+    /// MAX_STREAMS as it grows, in place of [`set_max_concurrent_streams`] from now on
+    ///
+    /// Closing a stream no longer grants the peer another, except one not marked with
+    /// [`mark_stream_relayed`], which grants one past `total`. The total never shrinks. Streams
+    /// granted are allocated as the peer opens them.
+    ///
+    /// [`set_max_concurrent_streams`]: Self::set_max_concurrent_streams
+    /// [`mark_stream_relayed`]: Self::mark_stream_relayed
+    pub fn set_max_remote_streams(&mut self, dir: Dir, total: VarInt) {
+        self.streams.set_max_remote(dir, total);
+        let pending = &mut self.spaces[SpaceId::Data].pending;
+        self.streams.queue_max_stream_id(pending);
+    }
+
+    /// Mark the peer's stream `id`, not closed yet, as relayed: under
+    /// [`set_max_remote_streams`](Self::set_max_remote_streams), closing it grants no stream
+    pub fn mark_stream_relayed(&mut self, id: StreamId) {
+        self.streams.mark_relayed(id);
+    }
+
     /// What this client connection sent before the server's first datagram arrived: each
     /// datagram's size, each Initial packet's number and encoded number length, whether 0-RTT
     /// packets went, and its first Initial's version and connection ID and token lengths
