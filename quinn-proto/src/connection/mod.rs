@@ -258,6 +258,12 @@ pub struct Connection {
     send_greased_quic_bit: bool,
     /// How many of the peer's packets cleared the QUIC bit (RFC 9287)
     greased_packets_received: u64,
+    /// The destination CID of the peer's latest non-probing packet on the current path
+    path_cid: Option<ConnectionId>,
+    /// How many times the peer moved to another address (see [`Self::peer_migrations`])
+    peer_migrations: u64,
+    /// Whether the peer's last move came with another destination CID
+    peer_migrated_cid: bool,
     /// QUIC version used for the connection.
     version: u32,
     /// The version the client chose, which its 0-RTT packets use whatever version compatible
@@ -438,6 +444,9 @@ impl Connection {
             last_received: None,
             reset_pending: None,
             greased_packets_received: 0,
+            path_cid: None,
+            peer_migrations: 0,
+            peer_migrated_cid: false,
             version,
             orig_version: version,
             pending_version,
@@ -1463,6 +1472,19 @@ impl Connection {
     /// authenticated packet once
     pub fn greased_packets_received(&self) -> u64 {
         self.greased_packets_received
+    }
+
+    /// How many times the peer moved to another address: a server connection migrating with
+    /// its client, on the client's first non-probing packet from there (RFC 9000 §9.3)
+    pub fn peer_migrations(&self) -> u64 {
+        self.peer_migrations
+    }
+
+    /// Whether the peer's last move to another address came with another connection ID, as an
+    /// active migration does (RFC 9000 §9.5), rather than with the one it had used (a NAT
+    /// rebinding the peer didn't notice)
+    pub fn peer_migrated_cid(&self) -> bool {
+        self.peer_migrated_cid
     }
 
     /// Drop the connection's state without telling the peer, as an endpoint that lost it: the
@@ -3085,6 +3107,7 @@ impl Connection {
         number: u64,
         packet: Packet,
     ) -> Result<(), TransportError> {
+        let dst_cid = packet.header.dst_cid();
         let payload = packet.payload.freeze();
         let mut is_probing_packet = true;
         let mut close = None;
@@ -3405,9 +3428,14 @@ impl Connection {
                 "migration-initiating packets should have been dropped immediately"
             );
             self.migrate(now, remote);
+            self.peer_migrations += 1;
+            self.peer_migrated_cid = self.path_cid != Some(dst_cid);
             // Break linkability, if possible
             self.update_rem_cid();
             self.spin = false;
+        }
+        if !is_probing_packet && number == self.spaces[SpaceId::Data].rx_packet {
+            self.path_cid = Some(dst_cid);
         }
 
         Ok(())

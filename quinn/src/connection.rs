@@ -284,6 +284,7 @@ impl Future for ConnectionDriver {
         conn.forward_stream_concurrency(&self.conn.shared);
         conn.forward_pings(&self.conn.shared);
         conn.forward_greased_packets(&self.conn.shared);
+        conn.forward_peer_migrations(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -686,6 +687,25 @@ impl Connection {
     /// One arriving after this is called wakes it, so it is called before reading the count.
     pub fn greased_packet_received(&self) -> impl Future<Output = ()> + Send + '_ {
         self.0.shared.greased_packet_received.notified()
+    }
+
+    /// How many times the peer moved to another address, and whether its last move came with
+    /// another connection ID (an active migration, not a NAT rebinding)
+    ///
+    /// See [`proto::Connection::peer_migrations()`], [`proto::Connection::peer_migrated_cid()`].
+    pub fn peer_migrations(&self) -> (u64, bool) {
+        let state = self.0.state.lock("peer_migrations");
+        (
+            state.inner.peer_migrations(),
+            state.inner.peer_migrated_cid(),
+        )
+    }
+
+    /// Resolves once the peer moved to another address
+    ///
+    /// One arriving after this is called wakes it, so it is called before reading the count.
+    pub fn peer_migrated(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.0.shared.peer_migrated.notified()
     }
 
     /// Drop the connection's state without telling the peer, ending it with
@@ -1136,6 +1156,7 @@ impl ConnectionRef {
                 stream_concurrency: [[0; 3]; 2],
                 pings: 0,
                 greased_packets: 0,
+                peer_migrations: 0,
             }),
             shared: Shared::default(),
         }))
@@ -1200,6 +1221,8 @@ pub(crate) struct Shared {
     ping_received: Notify,
     /// Notified when the driver sees a packet clearing the QUIC bit arrive
     greased_packet_received: Notify,
+    /// Notified when the driver sees the peer move to another address
+    peer_migrated: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
 }
@@ -1235,6 +1258,8 @@ pub(crate) struct State {
     pings: u64,
     /// How many of the peer's packets clearing the QUIC bit the driver last saw arrived
     greased_packets: u64,
+    /// How many of the peer's moves to another address the driver last saw
+    peer_migrations: u64,
 }
 
 impl State {
@@ -1321,10 +1346,12 @@ impl State {
     ) -> Result<(), ConnectionError> {
         loop {
             match self.conn_events.poll_recv(cx) {
-                Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
+                Poll::Ready(Some(ConnectionEvent::Rebind(socket, migrate))) => {
                     self.socket = socket;
                     self.io_poller = self.socket.clone().create_io_poller();
-                    self.inner.local_address_changed();
+                    if migrate {
+                        self.inner.local_address_changed();
+                    }
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
                     self.inner.handle_event(event);
@@ -1376,6 +1403,15 @@ impl State {
         if greased != self.greased_packets {
             self.greased_packets = greased;
             shared.greased_packet_received.notify_waiters();
+        }
+    }
+
+    /// Wakes the tasks waiting for the peer to move to another address, if it did
+    fn forward_peer_migrations(&mut self, shared: &Shared) {
+        let migrations = self.inner.peer_migrations();
+        if migrations != self.peer_migrations {
+            self.peer_migrations = migrations;
+            shared.peer_migrated.notify_waiters();
         }
     }
 

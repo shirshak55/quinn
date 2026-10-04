@@ -101,7 +101,9 @@ enum ConnectionEvent {
         reason: bytes::Bytes,
     },
     Proto(proto::ConnectionEvent),
-    Rebind(Arc<dyn AsyncUdpSocket>),
+    /// The endpoint's new socket, and whether the connection migrates to it (see
+    /// [`Endpoint::rebind_abstract_keeping_cids`])
+    Rebind(Arc<dyn AsyncUdpSocket>, bool),
 }
 
 fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {

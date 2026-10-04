@@ -251,6 +251,17 @@ impl Endpoint {
     ///
     /// On error, the old UDP socket is retained.
     pub fn rebind_abstract(&self, socket: Arc<dyn AsyncUdpSocket>) -> io::Result<()> {
+        self.rebind_socket(socket, true)
+    }
+
+    /// Switch to a new UDP socket as a NAT rebinding moves an endpoint: unlike
+    /// [`Endpoint::rebind_abstract()`], the connections keep their connection IDs and send
+    /// nothing for it, so their peers see only the address change (RFC 9000 §9.3)
+    pub fn rebind_abstract_keeping_cids(&self, socket: Arc<dyn AsyncUdpSocket>) -> io::Result<()> {
+        self.rebind_socket(socket, false)
+    }
+
+    fn rebind_socket(&self, socket: Arc<dyn AsyncUdpSocket>, migrate: bool) -> io::Result<()> {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
@@ -259,7 +270,7 @@ impl Endpoint {
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone()));
+            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.clone(), migrate));
         }
         if let Some(driver) = inner.driver.take() {
             // Ensure the driver can register for wake-ups from the new socket
