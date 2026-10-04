@@ -270,6 +270,7 @@ impl Future for ConnectionDriver {
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
         conn.forward_app_events(&self.conn.shared);
+        conn.forward_stream_concurrency(&self.conn.shared);
 
         if !conn.inner.is_drained() {
             if keep_going {
@@ -671,6 +672,36 @@ impl Connection {
         // May need to send MAX_STREAMS to make progress
         conn.wake();
     }
+
+    /// How many streams of `dir` the peer's stream limit lets this connection have open at once
+    ///
+    /// See [`proto::Connection::local_stream_concurrency()`].
+    pub fn local_stream_concurrency(&self, dir: Dir) -> u64 {
+        self.0
+            .state
+            .lock("local_stream_concurrency")
+            .inner
+            .local_stream_concurrency(dir)
+    }
+
+    /// Resolves once [`Self::local_stream_concurrency()`] changed for either direction
+    ///
+    /// A change made after this is called wakes it, so it is called before reading the value.
+    pub fn local_stream_concurrency_changed(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.0.shared.stream_concurrency_changed.notified()
+    }
+
+    /// What this client connection sent before the server's first datagram arrived
+    ///
+    /// See [`proto::Connection::sent_first_flight()`].
+    pub fn sent_first_flight(&self) -> Option<proto::FirstFlight> {
+        self.0
+            .state
+            .lock("sent_first_flight")
+            .inner
+            .sent_first_flight()
+            .cloned()
+    }
 }
 
 pin_project! {
@@ -926,6 +957,7 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                stream_concurrency: [0; 2],
             }),
             shared: Shared::default(),
         }))
@@ -984,6 +1016,8 @@ pub(crate) struct Shared {
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
+    /// Notified when the driver sees `local_stream_concurrency` change
+    stream_concurrency_changed: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
 }
@@ -1010,6 +1044,8 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    /// The local stream concurrency per direction the driver last saw
+    stream_concurrency: [u64; 2],
 }
 
 impl State {
@@ -1118,6 +1154,15 @@ impl State {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    /// Wakes the tasks waiting for the local stream concurrency to change, if it did
+    fn forward_stream_concurrency(&mut self, shared: &Shared) {
+        let concurrency = [Dir::Bi, Dir::Uni].map(|dir| self.inner.local_stream_concurrency(dir));
+        if concurrency != self.stream_concurrency {
+            self.stream_concurrency = concurrency;
+            shared.stream_concurrency_changed.notify_waiters();
         }
     }
 

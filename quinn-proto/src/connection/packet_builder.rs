@@ -127,6 +127,20 @@ impl PacketBuilder {
                 version,
             }),
         };
+        if let Some(flight) = conn
+            .sent_flight
+            .as_mut()
+            .filter(|_| conn.stats.udp_rx.datagrams == 0)
+        {
+            match &header {
+                Header::Initial(_) => flight.packets.push((exact_number, number.len() as u8)),
+                Header::Long {
+                    ty: LongType::ZeroRtt,
+                    ..
+                } => flight.zero_rtt = true,
+                _ => {}
+            }
+        }
         let partial_encode = header.encode(buffer);
         if conn.peer_params.grease_quic_bit && conn.rng.random() {
             buffer[partial_encode.start] ^= FIXED_BIT;

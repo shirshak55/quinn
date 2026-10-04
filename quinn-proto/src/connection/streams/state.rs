@@ -77,6 +77,9 @@ pub struct StreamsState {
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
     pub(super) max: [u64; 2],
+    /// Number of locally-initiated streams fully closed over the lifetime of the connection so
+    /// far, per direction
+    local_freed: [u64; 2],
     /// Whether opening a locally-initiated stream failed for `max`, per direction: a server
     /// sending 0.5-RTT data may try before a HelloRetryRequest's second ClientHello brings the
     /// peer's limits
@@ -168,6 +171,7 @@ impl StreamsState {
             free_recv: Vec::new(),
             next: [0, 0],
             max: [0, 0],
+            local_freed: [0, 0],
             open_blocked: [false, false],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
             sent_max_remote: [max_remote_bi.into(), max_remote_uni.into()],
@@ -257,6 +261,7 @@ impl StreamsState {
                 }
             }
             self.next[dir as usize] = 0;
+            self.local_freed[dir as usize] = 0;
 
             // If 0-RTT was rejected, any flow control frames we sent were lost.
             if self.flow_control_adjusted {
@@ -1012,6 +1017,10 @@ impl StreamsState {
         self.ensure_remote_streams(dir);
     }
 
+    pub(crate) fn local_concurrency(&self, dir: Dir) -> u64 {
+        self.max[dir as usize].saturating_sub(self.local_freed[dir as usize])
+    }
+
     pub(crate) fn max_concurrent(&self, dir: Dir) -> u64 {
         self.allocated_remote_count[dir as usize]
     }
@@ -1083,16 +1092,16 @@ impl StreamsState {
 
     /// Update counters for removal of a stream
     pub(super) fn stream_freed(&mut self, id: StreamId, half: StreamHalf) {
-        if id.initiator() != self.side {
-            let fully_free = id.dir() == Dir::Uni
-                || match half {
-                    StreamHalf::Send => !self.recv.contains_key(&id),
-                    StreamHalf::Recv => !self.send.contains_key(&id),
-                };
-            if fully_free {
-                self.allocated_remote_count[id.dir() as usize] -= 1;
-                self.ensure_remote_streams(id.dir());
-            }
+        let fully_free = id.dir() == Dir::Uni
+            || match half {
+                StreamHalf::Send => !self.recv.contains_key(&id),
+                StreamHalf::Recv => !self.send.contains_key(&id),
+            };
+        if fully_free && id.initiator() != self.side {
+            self.allocated_remote_count[id.dir() as usize] -= 1;
+            self.ensure_remote_streams(id.dir());
+        } else if fully_free {
+            self.local_freed[id.dir() as usize] += 1;
         }
         if half == StreamHalf::Send {
             self.send_streams -= 1;

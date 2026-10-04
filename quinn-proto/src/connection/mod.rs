@@ -15,9 +15,9 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
-    TransportErrorCode, VarInt,
+    Dir, Duration, EndpointConfig, FirstFlight, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE,
+    MAX_STREAM_COUNT, MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit,
+    TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -243,6 +243,8 @@ pub struct Connection {
     datagrams: DatagramState,
     /// Connection level statistics
     stats: ConnectionStats,
+    /// What a client connection sent before the server's first datagram arrived
+    sent_flight: Option<FirstFlight>,
     /// QUIC version used for the connection.
     version: u32,
 }
@@ -268,6 +270,16 @@ impl Connection {
         let path_validated = side_args.path_validated();
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
+        let sent_flight = match &connection_side {
+            ConnectionSide::Client { token, .. } => Some(FirstFlight {
+                version,
+                dst_cid_len: rem_cid.len(),
+                src_cid_len: loc_cid.len(),
+                token_len: token.len(),
+                ..FirstFlight::default()
+            }),
+            ConnectionSide::Server { .. } => None,
+        };
         let initial_space = PacketSpace {
             crypto: Some(crypto.initial_keys(&init_cid, side)),
             next_packet_number: config.initial_packet_number,
@@ -379,6 +391,7 @@ impl Connection {
             config,
             rng,
             stats: ConnectionStats::default(),
+            sent_flight,
             version,
         };
         if path_validated {
@@ -899,6 +912,7 @@ impl Connection {
                         buf,
                     );
                     self.stats.udp_tx.on_sent(1, buf.len());
+                    self.record_sent_datagrams(buf.len(), None);
                     return Some(Transmit {
                         destination: remote,
                         size: buf.len(),
@@ -1025,6 +1039,7 @@ impl Connection {
         self.path.total_sent = self.path.total_sent.saturating_add(buf.len() as u64);
 
         self.stats.udp_tx.on_sent(num_datagrams as u64, buf.len());
+        self.record_sent_datagrams(buf.len(), (num_datagrams > 1).then_some(segment_size));
 
         Some(Transmit {
             destination: self.path.remote,
@@ -1040,6 +1055,29 @@ impl Connection {
             },
             src_ip: self.local_ip,
         })
+    }
+
+    /// The first flight's record of a client connection still sending it (see
+    /// [`Self::sent_first_flight`])
+    fn first_flight_recording(&mut self) -> Option<&mut FirstFlight> {
+        match self.stats.udp_rx.datagrams {
+            0 => self.sent_flight.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// Records the datagrams of `size` bytes in total (each `segment_size` but the last) a
+    /// client connection sends in its first flight
+    fn record_sent_datagrams(&mut self, size: usize, segment_size: Option<usize>) {
+        let Some(flight) = self.first_flight_recording() else {
+            return;
+        };
+        let segment = segment_size.unwrap_or(size).max(1);
+        flight.datagram_sizes.extend(
+            (0..size)
+                .step_by(segment)
+                .map(|start| segment.min(size - start)),
+        );
     }
 
     /// Send PATH_CHALLENGE for a previous path if necessary
@@ -1465,6 +1503,25 @@ impl Connection {
         // now be significant.
         let pending = &mut self.spaces[SpaceId::Data].pending;
         self.streams.queue_max_stream_id(pending);
+    }
+
+    /// How many locally initiated streams of `dir` the peer's stream limit lets this endpoint
+    /// have open at once: those it may still open plus those not fully closed
+    ///
+    /// It grows as the peer raises its limit with MAX_STREAMS and shrinks as streams close, until
+    /// the peer raises it again.
+    pub fn local_stream_concurrency(&self, dir: Dir) -> u64 {
+        self.streams.local_concurrency(dir)
+    }
+
+    /// What this client connection sent before the server's first datagram arrived: each
+    /// datagram's size, each Initial packet's number and encoded number length, whether 0-RTT
+    /// packets went, and its first Initial's version and connection ID and token lengths
+    ///
+    /// `crypto` is left empty: the TLS session has the ClientHello. `None` for a server
+    /// connection.
+    pub fn sent_first_flight(&self) -> Option<&FirstFlight> {
+        self.sent_flight.as_ref()
     }
 
     /// Current number of remotely initiated streams that may be concurrently open
