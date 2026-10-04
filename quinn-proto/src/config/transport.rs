@@ -95,9 +95,9 @@ impl TransportConfig {
     /// Most incoming streams of each direction that may be open concurrently, whatever
     /// `max_concurrent_*_streams` or `Connection::set_max_remote_streams` grant
     ///
-    /// A grant past it waits for the peer's streams to close. With transport parameters sent by a
-    /// crypto session announcing more, a stream past it is a STREAM_LIMIT_ERROR. Defaults to
-    /// `None`: no cap.
+    /// A grant past it waits for the peer's streams to close. The streams the transport
+    /// parameters grant (`max_concurrent_*_streams`, which a crypto session sending its own
+    /// must match) stay granted, however many. Defaults to `None`: no cap.
     pub fn stream_concurrency_cap(&mut self, value: Option<VarInt>) -> &mut Self {
         self.stream_concurrency_cap = value;
         self

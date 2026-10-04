@@ -109,8 +109,11 @@ pub struct StreamsState {
     /// due to `set_max_concurrent` calls.
     max_concurrent_remote_count: [u64; 2],
     /// Most remotely-initiated streams per direction granted and not fully closed at once,
-    /// whatever `max_concurrent_remote_count` or `remote_total` grant
+    /// whatever `max_concurrent_remote_count` or `remote_total` grant, past `announced_remote`
     concurrency_cap: Option<u64>,
+    /// Remotely-initiated streams per direction the transport parameters granted, which
+    /// `concurrency_cap` can't take back
+    announced_remote: [u64; 2],
     /// Whether `max_concurrent_remote_count` has ever changed
     flow_control_adjusted: bool,
     /// Lowest remotely-initiated stream index that haven't actually been opened by the peer
@@ -201,6 +204,7 @@ impl StreamsState {
             relayed_from: [None, None],
             max_concurrent_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
             concurrency_cap: concurrency_cap.map(u64::from),
+            announced_remote: [max_remote_bi.into(), max_remote_uni.into()],
             flow_control_adjusted: false,
             next_remote: [0, 0],
             opened: [false, false],
@@ -264,7 +268,8 @@ impl StreamsState {
     /// to be open, and notify the peer if the window has moved
     ///
     /// Under `remote_total`, grants the peer that many streams plus one per stream freed
-    /// unrelayed instead. Either grant stops at `concurrency_cap` streams not fully closed.
+    /// unrelayed instead. Either grant stops at `concurrency_cap` streams not fully closed, once
+    /// past what the transport parameters granted.
     /// Allocates nothing: a stream's state is created as it is first used.
     fn ensure_remote_streams(&mut self, dir: Dir) {
         let dir = dir as usize;
@@ -276,6 +281,7 @@ impl StreamsState {
         let target = self
             .concurrency_cap
             .map_or(target, |cap| target.min(freed.saturating_add(cap)))
+            .max(self.announced_remote[dir])
             .min(MAX_STREAM_COUNT);
         if target > self.max_remote[dir] {
             self.allocated_remote_count[dir] += target - self.max_remote[dir];
