@@ -706,14 +706,19 @@ impl Connection {
 
                 // Anti-amplification is only based on `total_sent`, which gets
                 // updated at the end of this method. Therefore we pass the amount
-                // of bytes for datagrams that are already created, as well as 1 byte
-                // for starting another datagram. If there is any anti-amplification
-                // budget left, we always allow a full MTU to be sent
-                // (see https://github.com/quinn-rs/quinn/issues/1082)
-                if self
-                    .path
-                    .anti_amplification_blocked(segment_size as u64 * (num_datagrams as u64) + 1)
+                // of bytes for datagrams that are already created. Another is sized
+                // to what is left (RFC 9000 §8.1 allows no more than three times the
+                // bytes received, not even by part of a datagram), which must hold a
+                // packet: padded, if it is an Initial one that must be
+                let smallest = match space_id == SpaceId::Initial
+                    && (self.side.is_client() || ack_eliciting)
                 {
+                    true => usize::from(self.config.initial_datagram_size),
+                    false => MIN_PACKET_SPACE,
+                };
+                if self.path.anti_amplification_blocked(
+                    segment_size as u64 * (num_datagrams as u64) + smallest as u64,
+                ) {
                     trace!("blocked by anti-amplification");
                     break;
                 }
@@ -838,6 +843,15 @@ impl Connection {
                         std::cmp::min(segment_size, usize::from(INITIAL_MTU))
                     }
                 };
+                let next_datagram_size_limit = match self.path.validated {
+                    true => next_datagram_size_limit,
+                    false => {
+                        let sent =
+                            self.path.total_sent + segment_size as u64 * num_datagrams as u64;
+                        let left = (self.path.total_recvd * 3).saturating_sub(sent);
+                        next_datagram_size_limit.min(usize::try_from(left).unwrap_or(usize::MAX))
+                    }
+                };
                 buf_capacity += next_datagram_size_limit;
                 if buf.capacity() < buf_capacity {
                     // We reserve the maximum space for sending `max_datagrams` upfront
@@ -853,7 +867,10 @@ impl Connection {
                 num_datagrams += 1;
                 coalesce = true;
                 pad_datagram = false;
-                pad_size = MIN_INITIAL_SIZE;
+                // Padded only as far as anti-amplification allows (RFC 9000 §8.2.1), but for
+                // an Initial packet, which the datagram then holds in full (see above)
+                pad_size = MIN_INITIAL_SIZE
+                    .min(u16::try_from(next_datagram_size_limit).unwrap_or(u16::MAX));
                 datagram_start = buf.len();
 
                 debug_assert_eq!(
