@@ -1489,6 +1489,12 @@ impl Connection {
         self.spaces[self.highest_space].ping_pending = true;
     }
 
+    /// The idle timeout in effect: the local one until the peer's transport parameters arrive,
+    /// then the one negotiated with them (RFC 9000 §10.1), `None` for none
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
+    }
+
     /// Stop answering the peer, as an endpoint whose path to it failed: the datagrams it sends
     /// are dropped and nothing is sent, a close included, until the idle timeout ends the
     /// connection silently ([`ConnectionError::TimedOut`]), as it ends the peer's

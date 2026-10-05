@@ -644,6 +644,13 @@ impl Connection {
         conn.wake();
     }
 
+    /// The idle timeout in effect
+    ///
+    /// See [`proto::Connection::idle_timeout()`].
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.0.state.lock("idle_timeout").inner.idle_timeout()
+    }
+
     /// Resolves once a PING frame from the peer arrived, as `stats().frame_rx.ping` counts them
     ///
     /// One arriving after this is called wakes it, so it is called before reading the count.
