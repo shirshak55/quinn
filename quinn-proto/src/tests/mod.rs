@@ -1680,8 +1680,9 @@ fn migration() {
         pair.client.addr
     );
 
-    // Assert that the client's response to the PATH_CHALLENGE was an IMMEDIATE_ACK, instead of a
-    // second ping
+    // Assert that the client's response to each PATH_CHALLENGE (the second validating the path's
+    // MTU, the first held under 1200 bytes by anti-amplification) was an IMMEDIATE_ACK, instead
+    // of a second ping
     let client_stats_after_migrate = pair.client_conn_mut(client_ch).stats();
     assert_eq!(
         client_stats_after_migrate.frame_tx.ping - client_stats_after_connect.frame_tx.ping,
@@ -1690,7 +1691,7 @@ fn migration() {
     assert_eq!(
         client_stats_after_migrate.frame_tx.immediate_ack
             - client_stats_after_connect.frame_tx.immediate_ack,
-        1
+        2
     );
 }
 

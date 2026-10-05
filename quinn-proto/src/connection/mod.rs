@@ -997,7 +997,9 @@ impl Connection {
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
             if space_id == SpaceId::Data && num_datagrams == 1 {
-                if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
+                if let Some((token, remote, received)) =
+                    self.path_responses.pop_off_path(self.path.remote)
+                {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
                     let mut builder = builder_storage.take().unwrap();
@@ -1005,7 +1007,11 @@ impl Connection {
                     buf.write(frame::FrameType::PATH_RESPONSE);
                     buf.write(token);
                     self.stats.frame_tx.path_response += 1;
-                    builder.pad_to(MIN_INITIAL_SIZE);
+                    // Padded only as far as three times the challenge's packet (RFC 9000 §8.2.2):
+                    // the address it came from is unvalidated
+                    builder.pad_to(
+                        MIN_INITIAL_SIZE.min(u16::try_from(3 * received).unwrap_or(u16::MAX)),
+                    );
                     builder.finish_and_track(
                         now,
                         self,
@@ -1029,6 +1035,7 @@ impl Connection {
 
             let sent =
                 self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            self.path.challenge_undersized |= sent.path_challenge && pad_size < MIN_INITIAL_SIZE;
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -3177,6 +3184,7 @@ impl Connection {
         packet: Packet,
     ) -> Result<(), TransportError> {
         let dst_cid = packet.header.dst_cid();
+        let received = packet.header_data.len() + packet.payload.len();
         let payload = packet.payload.freeze();
         let mut is_probing_packet = true;
         let mut close = None;
@@ -3247,7 +3255,7 @@ impl Connection {
                     close = Some(reason);
                 }
                 Frame::PathChallenge(token) => {
-                    self.path_responses.push(number, token, remote);
+                    self.path_responses.push(number, token, remote, received);
                     if remote == self.path.remote {
                         // PATH_CHALLENGE on active path, possible off-path packet forwarding
                         // attack. Send a non-probing packet to recover the active path.
@@ -3259,10 +3267,21 @@ impl Connection {
                 }
                 Frame::PathResponse(token) => {
                     if self.path.challenge == Some(token) && remote == self.path.remote {
-                        trace!("new path validated");
                         self.timers.stop(Timer::PathValidation);
                         self.path.challenge = None;
-                        self.path.validated = true;
+                        // A challenge held under 1200 bytes leaves the path's MTU unvalidated: a
+                        // second one, padded in full, validates it (RFC 9000 §8.2.1)
+                        if mem::take(&mut self.path.challenge_undersized) {
+                            self.path.challenge = Some(self.rng.random());
+                            self.path.challenge_pending = true;
+                            self.timers
+                                .set(Timer::PathValidation, now + 3 * self.pto(SpaceId::Data));
+                        }
+                        if mem::replace(&mut self.path.validated, true) {
+                            trace!("path MTU validated");
+                            continue;
+                        }
+                        trace!("new path validated");
                         if let Some((_, ref mut prev_path)) = self.prev_path {
                             prev_path.challenge = None;
                             prev_path.challenge_pending = false;
@@ -3700,6 +3719,7 @@ impl Connection {
                 self.path.challenge_pending = false;
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
+                sent.path_challenge = true;
                 trace!("PATH_CHALLENGE {:08x}", token);
                 buf.write(frame::FrameType::PATH_CHALLENGE);
                 buf.write(token);
@@ -4578,6 +4598,8 @@ struct SentFrames {
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     requires_padding: bool,
+    /// Whether the packet contains the path's PATH_CHALLENGE
+    path_challenge: bool,
 }
 
 impl SentFrames {
