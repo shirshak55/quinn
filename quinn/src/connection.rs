@@ -701,6 +701,19 @@ impl Connection {
         )
     }
 
+    /// How many times the peer moved to another address, and how many of those moves came with
+    /// another connection ID, read together: moves coalesced between two reads changed the
+    /// connection ID if the second count grew
+    ///
+    /// See [`proto::Connection::peer_migrations()`], [`proto::Connection::peer_cid_migrations()`].
+    pub fn peer_migration_counts(&self) -> (u64, u64) {
+        let state = self.0.state.lock("peer_migration_counts");
+        (
+            state.inner.peer_migrations(),
+            state.inner.peer_cid_migrations(),
+        )
+    }
+
     /// Resolves once the peer moved to another address
     ///
     /// One arriving after this is called wakes it, so it is called before reading the count.

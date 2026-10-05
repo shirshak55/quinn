@@ -24,7 +24,7 @@ use crate::{
     compatible_versions,
     config::{ServerConfig, TransportConfig},
     crypto::{self, KeyPair, Keys, PacketKey},
-    endpoint::write_stateless_reset,
+    endpoint::{open_initial, write_stateless_reset},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
         FIXED_BIT, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType,
@@ -70,6 +70,7 @@ pub(crate) mod qlog;
 mod send_buffer;
 
 mod spaces;
+pub(crate) use spaces::MAX_ACK_BLOCKS;
 #[cfg(fuzzing)]
 pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
@@ -262,8 +263,13 @@ pub struct Connection {
     path_cid: Option<ConnectionId>,
     /// How many times the peer moved to another address (see [`Self::peer_migrations`])
     peer_migrations: u64,
+    /// How many of those moves came with another destination CID
+    peer_cid_migrations: u64,
     /// Whether the peer's last move came with another destination CID
     peer_migrated_cid: bool,
+    /// Whether the peer's move to the current path, while it awaits validation, came with
+    /// another destination CID
+    migrating_cid: bool,
     /// QUIC version used for the connection.
     version: u32,
     /// The version the client chose, which its 0-RTT packets use whatever version compatible
@@ -446,7 +452,9 @@ impl Connection {
             greased_packets_received: 0,
             path_cid: None,
             peer_migrations: 0,
+            peer_cid_migrations: 0,
             peer_migrated_cid: false,
+            migrating_cid: false,
             version,
             orig_version: version,
             pending_version,
@@ -1475,9 +1483,16 @@ impl Connection {
     }
 
     /// How many times the peer moved to another address: a server connection migrating with
-    /// its client, on the client's first non-probing packet from there (RFC 9000 §9.3)
+    /// its client, counted once the new path is validated (RFC 9000 §9.3), and not when its
+    /// validation fails or the peer returns to the address it had
     pub fn peer_migrations(&self) -> u64 {
         self.peer_migrations
+    }
+
+    /// How many of the peer's moves to another address (see [`Self::peer_migrations`]) came
+    /// with another connection ID, as an active migration does (RFC 9000 §9.5)
+    pub fn peer_cid_migrations(&self) -> u64 {
+        self.peer_cid_migrations
     }
 
     /// Whether the peer's last move to another address came with another connection ID, as an
@@ -2277,17 +2292,19 @@ impl Connection {
         }
     }
 
+    /// Numbers the server's Initial packets from `next` on, after those its endpoint sent
+    /// acknowledging the client's (see [`crate::Endpoint::acknowledge`]), and counts their `sent`
+    /// bytes against the anti-amplification limit
+    pub(crate) fn continue_acknowledgement(&mut self, next: u64, sent: u64) {
+        let space = &mut self.spaces[SpaceId::Initial];
+        space.next_packet_number = space.next_packet_number.max(next);
+        self.path.total_sent = self.path.total_sent.saturating_add(sent);
+    }
+
     /// Handle the already-decrypted first packet from the client
     ///
     /// Decrypting the first packet in the `Endpoint` allows stateless packet handling to be more
     /// efficient.
-    /// Numbers the server's Initial packets from `next` on, after those its endpoint sent
-    /// acknowledging the client's (see [`crate::Endpoint::acknowledge`])
-    pub(crate) fn continue_initial_packet_numbers(&mut self, next: u64) {
-        let space = &mut self.spaces[SpaceId::Initial];
-        space.next_packet_number = space.next_packet_number.max(next);
-    }
-
     pub(crate) fn handle_first_packet(
         &mut self,
         now: Instant,
@@ -2578,12 +2595,14 @@ impl Connection {
         if version == self.orig_version {
             return packet.is_initial() && self.orig_initial_crypto.is_some();
         }
-        packet.is_initial() && self.switch_version(version)
+        packet.is_initial() && self.switch_version(version, packet)
     }
 
     /// Switches a client connection to `version`, which the server negotiated from the one it
-    /// chose and offered, before the server's handshake data arrived (RFC 9368 §2.3)
-    fn switch_version(&mut self, version: u32) -> bool {
+    /// chose and offered, before the server's handshake data arrived (RFC 9368 §2.3), once
+    /// `packet`, an Initial packet of `version`, opens with `version`'s Initial keys: a packet
+    /// anyone can forge doesn't switch it
+    fn switch_version(&mut self, version: u32, packet: &PartialDecode) -> bool {
         let ConnectionSide::Client {
             available_versions, ..
         } = &self.side
@@ -2596,6 +2615,30 @@ impl Connection {
             || !available_versions.contains(&version)
             || self.crypto.switch_version(version).is_err()
         {
+            return false;
+        }
+        let cid = self.retry_src_cid.unwrap_or(self.initial_dst_cid);
+        let keys = self.crypto.initial_keys(&cid, self.side.side());
+        let opened = PartialDecode::new(
+            BytesMut::from(packet.data()),
+            &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
+            &self.endpoint_config.supported_versions,
+            self.endpoint_config.grease_quic_bit,
+        )
+        .ok()
+        .and_then(|(packet, _)| packet.finish(Some(&*keys.header.remote)).ok())
+        .and_then(|packet| {
+            open_initial(packet, &keys, Some(self.spaces[SpaceId::Initial].rx_packet))
+        })
+        .is_some();
+        if !opened {
+            debug!(
+                version,
+                "dropping unauthenticated packet of another version"
+            );
+            if self.crypto.switch_version(self.orig_version).is_err() {
+                error!("crypto session failed to switch back to the version it started with");
+            }
             return false;
         }
         debug!(
@@ -3023,8 +3066,15 @@ impl Connection {
                 self.process_payload(now, remote, number.unwrap(), packet)?;
                 Ok(())
             }
-            Header::VersionNegotiate { .. } => {
+            Header::VersionNegotiate {
+                src_cid, dst_cid, ..
+            } => {
                 if self.total_authed_packets > 1 {
+                    return Ok(());
+                }
+                // RFC 9000 §17.2.1: the server echoes the connection IDs of the client's packet
+                if dst_cid != self.handshake_cid || src_cid != self.rem_handshake_cid {
+                    debug!("discarding Version Negotiation not echoing our connection IDs");
                     return Ok(());
                 }
                 let versions = packet
@@ -3197,6 +3247,15 @@ impl Connection {
                         if let Some((_, ref mut prev_path)) = self.prev_path {
                             prev_path.challenge = None;
                             prev_path.challenge_pending = false;
+                        }
+                        if self
+                            .prev_path
+                            .as_ref()
+                            .is_none_or(|(_, prev_path)| prev_path.remote != remote)
+                        {
+                            self.peer_migrations += 1;
+                            self.peer_cid_migrations += u64::from(self.migrating_cid);
+                            self.peer_migrated_cid = self.migrating_cid;
                         }
                     } else {
                         debug!(token, "ignoring invalid PATH_RESPONSE");
@@ -3428,8 +3487,7 @@ impl Connection {
                 "migration-initiating packets should have been dropped immediately"
             );
             self.migrate(now, remote);
-            self.peer_migrations += 1;
-            self.peer_migrated_cid = self.path_cid != Some(dst_cid);
+            self.migrating_cid = self.path_cid != Some(dst_cid);
             // Break linkability, if possible
             self.update_rem_cid();
             self.spin = false;

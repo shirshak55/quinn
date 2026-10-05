@@ -24,7 +24,7 @@ use crate::{
     coding::BufMutExt,
     compatible_versions,
     config::{ClientConfig, EndpointConfig, ServerConfig},
-    connection::{Connection, ConnectionError, SideArgs},
+    connection::{Connection, ConnectionError, MAX_ACK_BLOCKS, SideArgs},
     crypto::{self, HmacKey, Keys, UnsupportedVersion},
     frame,
     packet::{
@@ -260,19 +260,21 @@ impl Endpoint {
                             .is_some_and(|n| n <= config.incoming_buffer_size_total)
                     {
                         // An acknowledged client's later ack-eliciting Initial packets are
-                        // acknowledged as they come
-                        let received =
-                            incoming_buffer
-                                .acknowledging
-                                .as_mut()
-                                .is_some_and(|acknowledging| {
-                                    acknowledging.receive(
-                                        &event,
+                        // acknowledged as they come, from its address only
+                        let received = incoming_buffer
+                            .acknowledging
+                            .as_mut()
+                            .filter(|acknowledging| acknowledging.addresses.remote == remote)
+                            .is_some_and(|acknowledging| {
+                                acknowledging.bytes_received += datagram_len as u64;
+                                datagram_len >= MIN_INITIAL_SIZE as usize
+                                    && acknowledging.receive(
+                                        datagram_bytes(&event),
                                         cid_len,
                                         &self.config.supported_versions,
                                         self.config.grease_quic_bit,
                                     )
-                                });
+                            });
                         incoming_buffer.datagrams.push(event);
                         incoming_buffer.total_bytes += datagram_len as u64;
                         self.all_incoming_buffers_total_bytes += datagram_len as u64;
@@ -604,23 +606,56 @@ impl Endpoint {
     /// and is refused from the same connection ID. `None` when the endpoint's connection IDs are
     /// zero-length, which can't route the client's next packets to `incoming`.
     pub fn acknowledge(&mut self, incoming: &Incoming, buf: &mut Vec<u8>) -> Option<Transmit> {
-        if self.local_cid_generator.cid_len() == 0 {
-            return None;
-        }
-        let mut received = ArrayRangeSet::new();
-        for (number, _) in self.incoming_first_flight(incoming).packets {
-            received.insert_one(number);
-        }
-        if received.is_empty() {
+        let cid_len = self.local_cid_generator.cid_len();
+        if cid_len == 0 {
             return None;
         }
         let header = &incoming.packet.header;
-        let server_config = &self.incoming_buffers[incoming.incoming_idx].server_config;
-        let keys = server_config
+        let first_len = incoming.packet.header_data.len()
+            + incoming.packet.payload.len()
+            + incoming.rest.as_ref().map_or(0, BytesMut::len);
+        let buffer = &self.incoming_buffers[incoming.incoming_idx];
+        let keys = buffer
+            .server_config
             .crypto
             .initial_keys(header.version, &header.dst_cid)
             .ok()?;
-        let first_number = server_config.transport.initial_packet_number;
+        let mut acknowledging = Acknowledging {
+            keys,
+            rem_cid: header.src_cid,
+            version: header.version,
+            addresses: incoming.addresses,
+            validated: incoming.remote_address_validated(),
+            bytes_received: first_len as u64,
+            received: ArrayRangeSet::new(),
+        };
+        let first = Packet {
+            header: Header::Initial(header.clone()),
+            header_data: incoming.packet.header_data.clone(),
+            payload: incoming.packet.payload.clone(),
+        };
+        if let Some((number, _, _)) = open_initial(first, &acknowledging.keys, None) {
+            acknowledging.insert(number);
+        }
+        let versions = &self.config.supported_versions;
+        let grease_quic_bit = self.config.grease_quic_bit;
+        if let Some(rest) = &incoming.rest {
+            acknowledging.receive(rest.clone(), cid_len, versions, grease_quic_bit);
+        }
+        for event in &buffer.datagrams {
+            if event.remote != incoming.addresses.remote {
+                continue;
+            }
+            let datagram = datagram_bytes(event);
+            acknowledging.bytes_received += datagram.len() as u64;
+            if datagram.len() >= MIN_INITIAL_SIZE as usize {
+                acknowledging.receive(datagram, cid_len, versions, grease_quic_bit);
+            }
+        }
+        if acknowledging.received.is_empty() {
+            return None;
+        }
+        let first_number = buffer.server_config.transport.initial_packet_number;
         if self.incoming_buffers[incoming.incoming_idx]
             .acknowledged
             .is_none()
@@ -639,15 +674,10 @@ impl Endpoint {
             self.incoming_buffers[incoming.incoming_idx].acknowledged = Some(Acknowledged {
                 loc_cid,
                 next_packet_number: first_number,
+                bytes_sent: 0,
             });
         }
-        self.incoming_buffers[incoming.incoming_idx].acknowledging = Some(Acknowledging {
-            keys,
-            rem_cid: header.src_cid,
-            version: header.version,
-            addresses: incoming.addresses,
-            received,
-        });
+        self.incoming_buffers[incoming.incoming_idx].acknowledging = Some(acknowledging);
         self.send_acknowledgement(incoming.incoming_idx, buf)
     }
 
@@ -658,7 +688,6 @@ impl Endpoint {
         let acknowledged = buffer.acknowledged.as_mut()?;
         let acknowledging = buffer.acknowledging.as_ref()?;
         let number = acknowledged.next_packet_number;
-        acknowledged.next_packet_number += 1;
         let header = Header::Initial(InitialHeader {
             dst_cid: acknowledging.rem_cid,
             src_cid: acknowledged.loc_cid,
@@ -670,6 +699,15 @@ impl Endpoint {
         let partial_encode = header.encode(buf);
         frame::Ack::encode(0, &acknowledging.received, None, buf);
         buf.resize(buf.len() + keys.packet.local.tag_len(), 0);
+        // RFC 9000 §8.1: at most three times the bytes received from an unvalidated address
+        let sent = acknowledged.bytes_sent + (buf.len() - partial_encode.start) as u64;
+        if !acknowledging.validated && acknowledging.bytes_received * 3 < sent {
+            trace!("acknowledgement blocked by the anti-amplification limit");
+            buf.truncate(partial_encode.start);
+            return None;
+        }
+        acknowledged.next_packet_number += 1;
+        acknowledged.bytes_sent = sent;
         partial_encode.finish(
             buf,
             &*keys.header.local,
@@ -915,7 +953,7 @@ impl Endpoint {
         );
         self.index.insert_initial(dst_cid, ch);
         if let Some(acknowledged) = acknowledged {
-            conn.continue_initial_packet_numbers(acknowledged.next_packet_number);
+            conn.continue_acknowledgement(acknowledged.next_packet_number, acknowledged.bytes_sent);
         }
 
         match conn.handle_first_packet(
@@ -1372,7 +1410,7 @@ pub(crate) fn write_stateless_reset(
 
 /// An Initial packet's number, its encoded length and its payload, decrypted with `keys`
 /// (`largest` the largest number received before), unless it fails to decrypt
-fn open_initial(
+pub(crate) fn open_initial(
     mut packet: Packet,
     keys: &Keys,
     largest: Option<u64>,
@@ -1405,24 +1443,25 @@ struct Acknowledging {
     rem_cid: ConnectionId,
     version: u32,
     addresses: FourTuple,
-    /// The numbers of its Initial packets received
+    /// Whether its address was validated, lifting the anti-amplification limit
+    validated: bool,
+    /// The bytes it sent from that address
+    bytes_received: u64,
+    /// The numbers of its Initial packets received, the oldest ranges dropped past
+    /// `MAX_ACK_BLOCKS` so that an ACK of them fits a minimum-size Initial packet
     received: ArrayRangeSet,
 }
 
 impl Acknowledging {
-    /// Records the Initial packets of `event`, a datagram the client sent: whether one is new
+    /// Records the Initial packets of `datagram`, which the client sent: whether one is new
     /// and ack-eliciting
     fn receive(
         &mut self,
-        event: &DatagramConnectionEvent,
+        mut datagram: BytesMut,
         cid_len: usize,
         supported_versions: &[u32],
         grease_quic_bit: bool,
     ) -> bool {
-        let mut datagram = BytesMut::from(event.first_decode.data());
-        if let Some(rest) = &event.remaining {
-            datagram.extend_from_slice(rest);
-        }
         let parser = FixedLengthConnectionIdParser::new(cid_len);
         let mut new = false;
         while !datagram.is_empty() {
@@ -1440,13 +1479,31 @@ impl Acknowledging {
                     let eliciting = frame::Iter::new(payload.freeze()).is_ok_and(|mut frames| {
                         frames.any(|frame| frame.is_ok_and(|frame| frame.is_ack_eliciting()))
                     });
-                    new |= self.received.insert_one(number) && eliciting;
+                    new |= self.insert(number) && eliciting;
                 }
             }
             datagram = rest.unwrap_or_default();
         }
         new
     }
+
+    /// Records the Initial packet `number`: whether it is new
+    fn insert(&mut self, number: u64) -> bool {
+        let new = self.received.insert_one(number);
+        if self.received.len() > MAX_ACK_BLOCKS {
+            self.received.pop_min();
+        }
+        new
+    }
+}
+
+/// The bytes of the datagram `event` carries
+fn datagram_bytes(event: &DatagramConnectionEvent) -> BytesMut {
+    let mut datagram = BytesMut::from(event.first_decode.data());
+    if let Some(rest) = &event.remaining {
+        datagram.extend_from_slice(rest);
+    }
+    datagram
 }
 
 /// How a pending incoming connection acknowledged the client's Initial packets
@@ -1456,6 +1513,9 @@ struct Acknowledged {
     loc_cid: ConnectionId,
     /// The Initial packet number its next packet takes
     next_packet_number: u64,
+    /// The bytes of the packets it sent, which count against the anti-amplification limit of
+    /// the connection accepted
+    bytes_sent: u64,
 }
 
 /// The versions the version_information transport parameter in `client_hello`, a TLS

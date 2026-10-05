@@ -84,7 +84,9 @@ pub trait Session: Send + Sync + 'static {
     /// are derived: [`Self::initial_keys`], the handshake keys and the 1-RTT keys are then
     /// `version`'s, while the 0-RTT keys stay the original version's (RFC 9369 §4.1)
     ///
-    /// Sessions that can't switch return `Err`, as by default.
+    /// A session switched so switches back to the version it started with, which a client does
+    /// when the packet of `version` prompting the switch fails to open with its keys. Sessions
+    /// that can't switch return `Err`, as by default.
     fn switch_version(&mut self, version: u32) -> Result<(), UnsupportedVersion> {
         let _ = version;
         Err(UnsupportedVersion)
