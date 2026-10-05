@@ -55,8 +55,11 @@ pub struct RecvStream {
     is_0rtt: bool,
     all_data_read: bool,
     reset: Option<proto::ReadError>,
-    /// Whether [`Self::stop_and_await_end`] awaits how the peer ends the stream
+    /// Whether how the peer ends this stopped stream is awaited, in the connection's
+    /// `stopped_ends` until this is dropped
     awaiting_end: bool,
+    /// How the peer had ended this stream when it was stopped
+    stopped_end: Option<Option<VarInt>>,
 }
 
 impl RecvStream {
@@ -68,6 +71,7 @@ impl RecvStream {
             all_data_read: false,
             reset: None,
             awaiting_end: false,
+            stopped_end: None,
         }
     }
 
@@ -277,7 +281,22 @@ impl RecvStream {
         if self.is_0rtt && conn.check_0rtt().is_err() {
             return Ok(());
         }
-        conn.inner.recv_stream(self.stream).stop(error_code)?;
+        if self.awaiting_end || self.stopped_end.is_some() {
+            // Stopped already: quinn-proto refuses it
+            return conn.inner.recv_stream(self.stream).stop(error_code);
+        }
+        // How the peer ends the stream is kept for `stop_and_await_end`, even if it ends before
+        match conn
+            .inner
+            .recv_stream(self.stream)
+            .stop_awaiting_end(error_code)?
+        {
+            Some(end) => self.stopped_end = Some(end),
+            None => {
+                conn.stopped_ends.insert(self.stream, None);
+                self.awaiting_end = true;
+            }
+        }
         conn.wake();
         self.all_data_read = true;
         // Clean up shared state that might be left over from a cancalled read
@@ -313,6 +332,9 @@ impl RecvStream {
         ) = self.reset
         {
             return Poll::Ready(Ok(Some(code)));
+        }
+        if let Some(end) = self.stopped_end {
+            return Poll::Ready(Ok(end));
         }
         let mut conn = self.conn.state.lock("RecvStream::stop_and_await_end");
         if self.is_0rtt && conn.check_0rtt().is_err() {

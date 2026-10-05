@@ -464,6 +464,8 @@ impl Connection {
         if path_validated {
             this.on_path_validated();
         }
+        this.streams
+            .set_receive_window_autotune(this.config.receive_window_autotune);
         if side.is_client() {
             // Kick off the connection
             this.write_crypto();
@@ -3749,6 +3751,8 @@ impl Connection {
                 &mut sent.retransmits,
                 &mut self.stats.frame_tx,
                 max_size,
+                now,
+                self.path.rtt.get(),
             );
         }
 

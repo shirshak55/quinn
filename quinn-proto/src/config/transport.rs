@@ -35,6 +35,7 @@ pub struct TransportConfig {
     pub(crate) stream_receive_window_bidi_remote: Option<VarInt>,
     pub(crate) stream_receive_window_uni: Option<VarInt>,
     pub(crate) receive_window: VarInt,
+    pub(crate) receive_window_autotune: Option<(u64, u64)>,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
 
@@ -200,6 +201,19 @@ impl TransportConfig {
     /// stream while another is blocked.
     pub fn receive_window(&mut self, value: VarInt) -> &mut Self {
         self.receive_window = value;
+        self
+    }
+
+    /// Grows the receive windows past [`stream_receive_window`](Self::stream_receive_window) and
+    /// [`receive_window`](Self::receive_window) while the application reads faster than they let
+    /// the peer send, up to the given most a stream's window and the connection's may reach
+    ///
+    /// As quic-go and Chrome autotune theirs: when more than half of a window is read in less than
+    /// four smoothed round trips' share of it, the window doubles for its next update, and the
+    /// connection's is kept at least 1.5 times any stream's. Windows never shrink, and the
+    /// transport parameters still announce the configured ones. Defaults to `None`: fixed windows.
+    pub fn receive_window_autotune(&mut self, value: Option<(u64, u64)>) -> &mut Self {
+        self.receive_window_autotune = value;
         self
     }
 
@@ -601,6 +615,7 @@ impl Default for TransportConfig {
             stream_receive_window_bidi_remote: None,
             stream_receive_window_uni: None,
             receive_window: VarInt::MAX,
+            receive_window_autotune: None,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
 
@@ -654,6 +669,7 @@ impl fmt::Debug for TransportConfig {
             stream_receive_window_bidi_remote,
             stream_receive_window_uni,
             receive_window,
+            receive_window_autotune,
             send_window,
             send_fairness,
             packet_threshold,
@@ -704,6 +720,7 @@ impl fmt::Debug for TransportConfig {
             )
             .field("stream_receive_window_uni", stream_receive_window_uni)
             .field("receive_window", receive_window)
+            .field("receive_window_autotune", receive_window_autotune)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)

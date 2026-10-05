@@ -4,11 +4,11 @@ use std::mem;
 use thiserror::Error;
 use tracing::debug;
 
-use super::state::get_or_insert_recv;
+use super::state::{get_or_insert_recv, grow_window};
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
-use crate::{TransportError, VarInt, frame};
+use crate::{Duration, Instant, TransportError, VarInt, frame};
 
 #[derive(Debug, Default)]
 pub(super) struct Recv {
@@ -20,6 +20,9 @@ pub(super) struct Recv {
     pub(super) stopped: bool,
     /// Whether the application awaits how the peer ends this stopped stream
     pub(super) awaiting_end: bool,
+    /// The window `MAX_STREAM_DATA` grants past the data read, and its autotune epoch
+    window: u64,
+    epoch: Option<(Instant, u64)>,
 }
 
 impl Recv {
@@ -31,6 +34,8 @@ impl Recv {
             end: 0,
             stopped: false,
             awaiting_end: false,
+            window: initial_max_data,
+            epoch: None,
         })
     }
 
@@ -42,6 +47,8 @@ impl Recv {
         self.end = 0;
         self.stopped = false;
         self.awaiting_end = false;
+        self.window = initial_max_data;
+        self.epoch = None;
     }
 
     /// Process a STREAM frame
@@ -120,7 +127,8 @@ impl Recv {
     /// transmission of the value is recommended. If the boolean value is
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
-    pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
+    pub(super) fn max_stream_data(&mut self) -> (u64, ShouldTransmit) {
+        let stream_receive_window = self.window;
         let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
 
         // Only announce a window update if it's significant enough
@@ -133,6 +141,13 @@ impl Recv {
         let diff = max_stream_data - self.sent_max_stream_data;
         let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
         (max_stream_data, ShouldTransmit(transmit))
+    }
+
+    /// Grows the window, up to `max`, if it was read fast enough (see [`grow_window`]); returns the
+    /// grown window
+    pub(super) fn autotune(&mut self, max: u64, now: Instant, rtt: Duration) -> Option<u64> {
+        let read = self.assembler.bytes_read();
+        grow_window(&mut self.window, &mut self.epoch, read, max, now, rtt).then_some(self.window)
     }
 
     /// Records that a `MAX_STREAM_DATA` announcing a certain window was sent
@@ -462,11 +477,7 @@ impl<'a> Chunks<'a> {
 
         // If the stream hasn't finished, we may need to issue stream-level flow control credit
         if let ChunksState::Readable(mut rs) = state {
-            let (_, max_stream_data) = rs.max_stream_data(
-                self.streams
-                    .stream_receive_window
-                    .of(self.streams.side, self.id),
-            );
+            let (_, max_stream_data) = rs.max_stream_data();
             should_transmit |= max_stream_data.0;
             if max_stream_data.0 {
                 self.pending.max_stream_data.insert(self.id);
@@ -607,7 +618,7 @@ mod tests {
             "full connection flow control credit is issued by stop"
         );
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,
@@ -632,7 +643,7 @@ mod tests {
         assert_eq!(new_bytes, RECV_WINDOW - (INITIAL_OFFSET + INITIAL_BYTES));
         assert!(!is_closed);
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,
@@ -659,7 +670,7 @@ mod tests {
         );
         assert!(!is_closed);
 
-        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        let (max_stream_data, transmit) = s.max_stream_data();
         assert!(!transmit.should_transmit());
         assert_eq!(
             max_stream_data, RECV_WINDOW,
