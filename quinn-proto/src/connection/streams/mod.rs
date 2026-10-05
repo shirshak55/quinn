@@ -174,14 +174,18 @@ impl RecvStream<'_> {
     /// with its RESET_STREAM's error code, or `None` by sending all of it
     ///
     /// Returns that end if the peer already ended the stream, else a [`StreamEvent::StoppedEnded`]
-    /// reports it.
+    /// reports it. A stream already stopped whose state is kept has its end still to come, which
+    /// is then awaited.
     pub fn stop_awaiting_end(
         &mut self,
         error_code: VarInt,
     ) -> Result<Option<Option<VarInt>>, ClosedStream> {
-        let ended = match self.state.recv.get(&self.id) {
-            Some(stream) => match stream.as_ref().and_then(|s| s.as_open_recv()) {
-                Some(stream) if stream.stopped => return Err(ClosedStream { _private: () }),
+        let ended = match self.state.recv.get_mut(&self.id) {
+            Some(stream) => match stream.as_mut().and_then(|s| s.as_open_recv_mut()) {
+                Some(stream) if stream.stopped => {
+                    stream.awaiting_end = true;
+                    return Ok(None);
+                }
                 Some(stream) => stream.ended(),
                 None => None,
             },

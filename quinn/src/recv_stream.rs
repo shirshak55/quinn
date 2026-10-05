@@ -396,6 +396,7 @@ impl RecvStream {
                     // Stream state has just now been freed, so the connection may need to issue new
                     // stream ID flow control credit
                     conn.wake();
+                    self.reset = Some(proto::ReadError::Reset(error_code));
                     Poll::Ready(Ok(Some(error_code)))
                 }
                 Ok(None) => {
