@@ -1398,6 +1398,11 @@ impl Connection {
                     self.zero_rtt_crypto = None;
                     self.prev_crypto = None;
                 }
+                Timer::PathValidation if self.path.challenge.is_none() => {
+                    debug!("path MTU validation failed");
+                    self.path.mtu_challenge = None;
+                    self.path.mtu_challenge_pending = false;
+                }
                 Timer::PathValidation => {
                     debug!("path validation failed");
                     if let Some((_, prev)) = self.prev_path.take() {
@@ -1405,6 +1410,8 @@ impl Connection {
                     }
                     self.path.challenge = None;
                     self.path.challenge_pending = false;
+                    self.path.mtu_challenge = None;
+                    self.path.mtu_challenge_pending = false;
                 }
                 Timer::Pacing => trace!("pacing timer expired"),
                 Timer::PushNewCid => {
@@ -3278,15 +3285,12 @@ impl Connection {
                         // A challenge held under 1200 bytes leaves the path's MTU unvalidated: a
                         // second one, padded in full, validates it (RFC 9000 §8.2.1)
                         if mem::take(&mut self.path.challenge_undersized) {
-                            self.path.challenge = Some(self.rng.random());
-                            self.path.challenge_pending = true;
+                            self.path.mtu_challenge = Some(self.rng.random());
+                            self.path.mtu_challenge_pending = true;
                             self.timers
                                 .set(Timer::PathValidation, now + 3 * self.pto(SpaceId::Data));
                         }
-                        if mem::replace(&mut self.path.validated, true) {
-                            trace!("path MTU validated");
-                            continue;
-                        }
+                        self.path.validated = true;
                         trace!("new path validated");
                         if let Some((_, ref mut prev_path)) = self.prev_path {
                             prev_path.challenge = None;
@@ -3301,6 +3305,10 @@ impl Connection {
                             self.peer_cid_migrations += u64::from(self.migrating_cid);
                             self.peer_migrated_cid = self.migrating_cid;
                         }
+                    } else if self.path.mtu_challenge == Some(token) && remote == self.path.remote {
+                        self.timers.stop(Timer::PathValidation);
+                        self.path.mtu_challenge = None;
+                        trace!("path MTU validated");
                     } else {
                         debug!(token, "ignoring invalid PATH_RESPONSE");
                     }
@@ -3719,10 +3727,12 @@ impl Connection {
 
         // PATH_CHALLENGE
         if buf.len() + 9 < max_size && space_id == SpaceId::Data {
-            // Transmit challenges with every outgoing frame on an unvalidated path
-            if let Some(token) = self.path.challenge {
+            // Transmit challenges with every outgoing frame on an unvalidated path, or one whose
+            // MTU is being validated
+            if let Some(token) = self.path.challenge.or(self.path.mtu_challenge) {
                 // But only send a packet solely for that purpose at most once
                 self.path.challenge_pending = false;
+                self.path.mtu_challenge_pending = false;
                 sent.non_retransmits = true;
                 sent.requires_padding = true;
                 sent.path_challenge = true;
@@ -4235,6 +4245,7 @@ impl Connection {
     fn can_send_1rtt(&self, max_size: usize) -> bool {
         self.streams.can_send_stream_data()
             || self.path.challenge_pending
+            || self.path.mtu_challenge_pending
             || self
                 .prev_path
                 .as_ref()

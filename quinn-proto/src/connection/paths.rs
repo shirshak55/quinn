@@ -27,6 +27,10 @@ pub(super) struct PathData {
     /// Whether a datagram carrying `challenge` was held under 1200 bytes by the
     /// anti-amplification limit, so its response leaves the path's MTU unvalidated
     pub(super) challenge_undersized: bool,
+    /// The challenge validating the MTU of a path validated by an undersized one (RFC 9000
+    /// §8.2.1): the path counts as validated meanwhile, and stays if it goes unanswered
+    pub(super) mtu_challenge: Option<u64>,
+    pub(super) mtu_challenge_pending: bool,
     /// Whether we're certain the peer can both send and receive on this address
     ///
     /// Initially equal to `use_stateless_retry` for servers, and becomes false again on every
@@ -84,6 +88,8 @@ impl PathData {
             challenge: None,
             challenge_pending: false,
             challenge_undersized: false,
+            mtu_challenge: None,
+            mtu_challenge_pending: false,
             validated: false,
             total_sent: 0,
             total_recvd: 0,
@@ -128,6 +134,8 @@ impl PathData {
             challenge: None,
             challenge_pending: false,
             challenge_undersized: false,
+            mtu_challenge: None,
+            mtu_challenge_pending: false,
             validated: false,
             total_sent: 0,
             total_recvd: 0,
