@@ -1097,8 +1097,9 @@ impl Connection {
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
 
-        // Send MTU probe if necessary
-        if buf.is_empty() && self.state.is_established() {
+        // Send MTU probe if necessary, once the path is validated: padded, it would exceed
+        // what anti-amplification allows on an unvalidated one (RFC 9000 §8.1)
+        if buf.is_empty() && self.state.is_established() && self.path.validated {
             let space_id = SpaceId::Data;
             let probe_size = self
                 .path
@@ -1318,15 +1319,17 @@ impl Connection {
                 let data_len = first_decode.len();
 
                 self.handle_decode(now, remote, ecn, first_decode);
-                // The current `path` might have changed inside `handle_decode`,
-                // since the packet could have triggered a migration. Make sure
-                // the data received is accounted for the most recent path by accessing
-                // `path` after `handle_decode`.
-                self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
-
                 if let Some(data) = remaining {
                     self.stats.udp_rx.bytes += data.len() as u64;
                     self.handle_coalesced(now, remote, ecn, data);
+                }
+                // The current `path` might have changed while handling the datagram,
+                // since a packet could have triggered a migration. Make sure
+                // the data received is accounted for the most recent path by accessing
+                // `path` afterwards, and only if it came from that path's address: what is
+                // sent to an unvalidated address is limited by what it sent (RFC 9000 §8.1).
+                if remote == self.path.remote {
+                    self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
                 }
 
                 self.config.qlog_sink.emit_recovery_metrics(
@@ -2576,7 +2579,7 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
     ) {
-        self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
+        let len = data.len();
         let mut remaining = Some(data);
         while let Some(data) = remaining {
             match PartialDecode::new(
@@ -2591,9 +2594,13 @@ impl Connection {
                 }
                 Err(e) => {
                     trace!("malformed header: {}", e);
-                    return;
+                    break;
                 }
             }
+        }
+        // Accounted for the path it came from, as in `handle_event`
+        if remote == self.path.remote {
+            self.path.total_recvd = self.path.total_recvd.saturating_add(len as u64);
         }
     }
 
