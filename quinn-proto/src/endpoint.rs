@@ -1836,6 +1836,11 @@ impl Incoming {
     pub fn orig_dst_cid(&self) -> &ConnectionId {
         &self.token.orig_dst_cid
     }
+
+    /// The source connection ID of the client's Initial packet
+    pub fn src_cid(&self) -> &ConnectionId {
+        &self.packet.header.src_cid
+    }
 }
 
 impl fmt::Debug for Incoming {

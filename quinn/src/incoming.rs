@@ -121,6 +121,11 @@ impl Incoming {
     pub fn orig_dst_cid(&self) -> ConnectionId {
         *self.0.as_ref().unwrap().inner.orig_dst_cid()
     }
+
+    /// The source CID of the client's Initial packet
+    pub fn src_cid(&self) -> ConnectionId {
+        *self.0.as_ref().unwrap().inner.src_cid()
+    }
 }
 
 impl Drop for Incoming {
